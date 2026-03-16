@@ -88,13 +88,6 @@ function initDatabase(dbPath) {
       comments TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS documents (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      application_number TEXT NOT NULL REFERENCES applications(reference_number),
-      document_name TEXT,
-      document_type TEXT,
-      document_date TEXT
-    );
   `);
 
   return db;
@@ -245,7 +238,7 @@ async function fetchFullDetail(page, modulePath, referenceNumber) {
   });
 
   return page.evaluate(() => {
-    const result = { fields: {}, subPermits: [], fees: [], inspections: [], documents: [] };
+    const result = { fields: {}, subPermits: [], fees: [], inspections: [] };
 
     // Top-level displayFields (application summary)
     const summaryFieldset = document.querySelector('fieldset');
@@ -322,43 +315,6 @@ async function fetchFullDetail(page, modulePath, referenceNumber) {
         result.inspections.push(entry);
       });
     });
-
-    // Documents table — look for tables with document-related headers or within Documents fieldsets
-    document.querySelectorAll('fieldset').forEach(fs => {
-      const legend = fs.querySelector('legend');
-      if (!legend) return;
-      const name = legend.textContent.trim().toLowerCase();
-      if (!name.includes('document') && !name.includes('image')) return;
-
-      fs.querySelectorAll('table').forEach(table => {
-        const headerNames = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
-        Array.from(table.rows).slice(1).forEach(row => {
-          const cells = Array.from(row.cells).map(c => c.textContent.trim());
-          if (cells.length < 1) return;
-          const entry = {};
-          headerNames.forEach((h, i) => { if (cells[i]) entry[h] = cells[i]; });
-          result.documents.push(entry);
-        });
-      });
-    });
-
-    // Also check for document tables outside fieldsets
-    if (result.documents.length === 0) {
-      document.querySelectorAll('table').forEach(table => {
-        const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim().toLowerCase());
-        const isDocTable = headers.some(h => h.includes('document') || h.includes('file'));
-        if (!isDocTable) return;
-
-        const headerNames = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
-        Array.from(table.rows).slice(1).forEach(row => {
-          const cells = Array.from(row.cells).map(c => c.textContent.trim());
-          if (cells.length < 1) return;
-          const entry = {};
-          headerNames.forEach((h, i) => { if (cells[i]) entry[h] = cells[i]; });
-          result.documents.push(entry);
-        });
-      });
-    }
 
     return result;
   });
@@ -481,23 +437,12 @@ function insertInspection(db, insp) {
     );
 }
 
-function insertDocument(db, doc) {
-  db.prepare(`INSERT INTO documents
-    (application_number, document_name, document_type, document_date)
-    VALUES (?, ?, ?, ?)`)
-    .run(
-      doc.applicationNumber,
-      nullIfEmpty(doc.documentName), nullIfEmpty(doc.documentType),
-      nullIfEmpty(doc.documentDate),
-    );
-}
-
 // ─── Module fetchers ─────────────────────────────────────────────────
 
 async function fetchAndStoreComplaints(page, db, parcel) {
   const refs = await getModuleRefs(page, 'CodeEnforcement', 'caseNumber', parcel);
   for (const ref of refs) {
-    const { fields, fees, inspections, documents } = await fetchFullDetail(page, 'CodeEnforcement', ref);
+    const { fields, fees, inspections } = await fetchFullDetail(page, 'CodeEnforcement', ref);
     const appNum = fields['Case Number'] || ref;
 
     insertApplication(db, {
@@ -538,14 +483,6 @@ async function fetchAndStoreComplaints(page, db, parcel) {
       });
     }
 
-    for (const doc of documents) {
-      insertDocument(db, {
-        applicationNumber: appNum,
-        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
-        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
-        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
-      });
-    }
   }
   return refs.length;
 }
@@ -553,7 +490,7 @@ async function fetchAndStoreComplaints(page, db, parcel) {
 async function fetchAndStorePermits(page, db, parcel) {
   const refs = await getModuleRefs(page, 'Permit', 'permitNumber', parcel);
   for (const ref of refs) {
-    const { fields, subPermits, fees, inspections, documents } = await fetchFullDetail(page, 'Permit', ref);
+    const { fields, subPermits, fees, inspections } = await fetchFullDetail(page, 'Permit', ref);
     const appNum = fields['Application Number'] || ref;
 
     insertApplication(db, {
@@ -605,14 +542,6 @@ async function fetchAndStorePermits(page, db, parcel) {
       });
     }
 
-    for (const doc of documents) {
-      insertDocument(db, {
-        applicationNumber: appNum,
-        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
-        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
-        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
-      });
-    }
   }
   return refs.length;
 }
@@ -620,7 +549,7 @@ async function fetchAndStorePermits(page, db, parcel) {
 async function fetchAndStorePlanning(page, db, parcel) {
   const refs = await getModuleRefs(page, 'Planning', 'applicationNumber', parcel);
   for (const ref of refs) {
-    const { fields, fees, inspections, documents } = await fetchFullDetail(page, 'Planning', ref);
+    const { fields, fees, inspections } = await fetchFullDetail(page, 'Planning', ref);
     const appNum = fields['Application Number'] || ref;
 
     insertApplication(db, {
@@ -661,14 +590,6 @@ async function fetchAndStorePlanning(page, db, parcel) {
       });
     }
 
-    for (const doc of documents) {
-      insertDocument(db, {
-        applicationNumber: appNum,
-        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
-        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
-        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
-      });
-    }
   }
   return refs.length;
 }
@@ -676,7 +597,7 @@ async function fetchAndStorePlanning(page, db, parcel) {
 async function fetchAndStoreLicenses(page, db, parcel) {
   const refs = await getModuleRefs(page, 'License', 'licenseNumber', parcel);
   for (const ref of refs) {
-    const { fields, fees, inspections, documents } = await fetchFullDetail(page, 'License', ref);
+    const { fields, fees, inspections } = await fetchFullDetail(page, 'License', ref);
     const appNum = fields['License Number'] || ref;
 
     insertApplication(db, {
@@ -717,14 +638,6 @@ async function fetchAndStoreLicenses(page, db, parcel) {
       });
     }
 
-    for (const doc of documents) {
-      insertDocument(db, {
-        applicationNumber: appNum,
-        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
-        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
-        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
-      });
-    }
   }
   return refs.length;
 }
@@ -847,11 +760,10 @@ async function main() {
       subPermits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
       fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
       inspections: db.prepare('SELECT COUNT(*) as n FROM inspections').get().n,
-      documents: db.prepare('SELECT COUNT(*) as n FROM documents').get().n,
     };
 
     console.log(`\n==================================`);
-    console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections, ${counts.documents} documents`);
+    console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections`);
     console.log(`Database: ${path.resolve(opts.output)}`);
   } finally {
     await browser.close();
