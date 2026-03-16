@@ -753,9 +753,22 @@ async function runParcelMode(opts) {
     const isAuthenticated = await login(page);
 
     let processed = 0;
+    const RELOGIN_INTERVAL = 20;
 
     for (const row of pending) {
       processed++;
+
+      // Re-login periodically to prevent session expiry
+      if (isAuthenticated && processed > 1 && (processed - 1) % RELOGIN_INTERVAL === 0) {
+        console.log('  [Re-logging in to refresh session...]');
+        try {
+          page = await initPage(context);
+          await login(page);
+        } catch {
+          page = await initPage(context);
+        }
+      }
+
       const parcel = row.parcel_number;
       const address = row.address || parcel;
       console.log(`[${alreadyDone + processed}/${allRows.length}] ${address} (${parcel})`);
