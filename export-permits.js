@@ -46,10 +46,42 @@ function initDatabase(dbPath) {
       historic_district_id TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS applications (
+    CREATE TABLE IF NOT EXISTS code_enforcement (
+      case_number TEXT PRIMARY KEY,
+      parcel_number TEXT NOT NULL REFERENCES properties(parcel_number),
+      complaint_type TEXT,
+      status TEXT,
+      description TEXT,
+      date_entered TEXT,
+      fetched_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ce_inspections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      case_number TEXT NOT NULL REFERENCES code_enforcement(case_number),
+      inspection_type TEXT,
+      request_date TEXT,
+      scheduled_date TEXT,
+      completed_date TEXT,
+      inspector TEXT,
+      result TEXT,
+      comments TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS ce_fees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      case_number TEXT NOT NULL REFERENCES code_enforcement(case_number),
+      description TEXT,
+      amount REAL,
+      paid REAL,
+      owing REAL,
+      date_paid TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS permits (
       reference_number TEXT PRIMARY KEY,
       parcel_number TEXT NOT NULL REFERENCES properties(parcel_number),
-      record_type TEXT NOT NULL,  -- 'Permit', 'Code Enforcement', 'Planning', 'License'
+      record_type TEXT NOT NULL,  -- 'Permit', 'Planning', 'License'
       application_type TEXT,
       work_class TEXT,
       status TEXT,
@@ -63,7 +95,7 @@ function initDatabase(dbPath) {
 
     CREATE TABLE IF NOT EXISTS sub_permits (
       permit_number TEXT PRIMARY KEY,
-      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      reference_number TEXT NOT NULL REFERENCES permits(reference_number),
       permit_type TEXT,
       permit_status TEXT,
       date_issued TEXT,
@@ -72,7 +104,7 @@ function initDatabase(dbPath) {
 
     CREATE TABLE IF NOT EXISTS fees (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      reference_number TEXT NOT NULL REFERENCES permits(reference_number),
       description TEXT,
       amount REAL,
       paid REAL,
@@ -82,7 +114,7 @@ function initDatabase(dbPath) {
 
     CREATE TABLE IF NOT EXISTS inspections (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      reference_number TEXT NOT NULL REFERENCES permits(reference_number),
       inspection_type TEXT,
       request_date TEXT,
       scheduled_date TEXT,
@@ -398,8 +430,44 @@ function insertProperty(db, parcel, address, opts = {}) {
       opts.propertyClass || null, opts.historicDistrictId || null);
 }
 
-function insertApplication(db, app) {
-  db.prepare(`INSERT OR REPLACE INTO applications
+function insertCase(db, ce) {
+  db.prepare(`INSERT OR REPLACE INTO code_enforcement
+    (case_number, parcel_number, complaint_type, status, description, date_entered)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(
+      ce.caseNumber, ce.parcelNumber,
+      nullIfEmpty(ce.complaintType), nullIfEmpty(ce.status),
+      nullIfEmpty(ce.description), nullIfEmpty(ce.dateEntered),
+    );
+}
+
+function insertCeInspection(db, insp) {
+  db.prepare(`INSERT INTO ce_inspections
+    (case_number, inspection_type, request_date, scheduled_date,
+     completed_date, inspector, result, comments)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      insp.caseNumber,
+      nullIfEmpty(insp.inspectionType), nullIfEmpty(insp.requestDate),
+      nullIfEmpty(insp.scheduledDate), nullIfEmpty(insp.completedDate),
+      nullIfEmpty(insp.inspector), nullIfEmpty(insp.result),
+      nullIfEmpty(insp.comments),
+    );
+}
+
+function insertCeFee(db, fee) {
+  db.prepare(`INSERT INTO ce_fees
+    (case_number, description, amount, paid, owing, date_paid)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(
+      fee.caseNumber, nullIfEmpty(fee.description),
+      parseDollar(fee.amount), parseDollar(fee.paid),
+      parseDollar(fee.owing), nullIfEmpty(fee.datePaid),
+    );
+}
+
+function insertPermit(db, app) {
+  db.prepare(`INSERT OR REPLACE INTO permits
     (reference_number, parcel_number, record_type, application_type, work_class,
      status, description, application_date, issued_date, expiration_date, date_finaled)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -414,10 +482,10 @@ function insertApplication(db, app) {
 
 function insertSubPermit(db, sp) {
   db.prepare(`INSERT OR REPLACE INTO sub_permits
-    (permit_number, application_number, permit_type, permit_status, date_issued, expiration_date)
+    (permit_number, reference_number, permit_type, permit_status, date_issued, expiration_date)
     VALUES (?, ?, ?, ?, ?, ?)`)
     .run(
-      sp.permitNumber, sp.applicationNumber,
+      sp.permitNumber, sp.referenceNumber,
       nullIfEmpty(sp.permitType), nullIfEmpty(sp.permitStatus),
       nullIfEmpty(sp.dateIssued), nullIfEmpty(sp.expirationDate),
     );
@@ -425,10 +493,10 @@ function insertSubPermit(db, sp) {
 
 function insertFee(db, fee) {
   db.prepare(`INSERT INTO fees
-    (application_number, description, amount, paid, owing, date_paid)
+    (reference_number, description, amount, paid, owing, date_paid)
     VALUES (?, ?, ?, ?, ?, ?)`)
     .run(
-      fee.applicationNumber, nullIfEmpty(fee.description),
+      fee.referenceNumber, nullIfEmpty(fee.description),
       parseDollar(fee.amount), parseDollar(fee.paid),
       parseDollar(fee.owing), nullIfEmpty(fee.datePaid),
     );
@@ -436,11 +504,11 @@ function insertFee(db, fee) {
 
 function insertInspection(db, insp) {
   db.prepare(`INSERT INTO inspections
-    (application_number, inspection_type, request_date, scheduled_date,
+    (reference_number, inspection_type, request_date, scheduled_date,
      completed_date, inspector, result, comments)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(
-      insp.applicationNumber,
+      insp.referenceNumber,
       nullIfEmpty(insp.inspectionType), nullIfEmpty(insp.requestDate),
       nullIfEmpty(insp.scheduledDate), nullIfEmpty(insp.completedDate),
       nullIfEmpty(insp.inspector), nullIfEmpty(insp.result),
@@ -454,25 +522,20 @@ async function fetchAndStoreComplaints(page, db, parcel) {
   const refs = await getModuleRefs(page, 'CodeEnforcement', 'caseNumber', parcel);
   for (const ref of refs) {
     const { fields, fees, inspections } = await fetchFullDetail(page, 'CodeEnforcement', ref);
-    const appNum = fields['Case Number'] || ref;
+    const caseNum = fields['Case Number'] || ref;
 
-    insertApplication(db, {
-      referenceNumber: appNum,
+    insertCase(db, {
+      caseNumber: caseNum,
       parcelNumber: parcel,
-      recordType: 'Code Enforcement',
-      applicationType: fields['Complaint Type'],
-      workClass: null,
+      complaintType: fields['Complaint Type'],
       status: fields['Status'],
       description: fields['Description'],
-      applicationDate: fields['Date Entered'],
-      issuedDate: null,
-      expirationDate: null,
-      dateFinaled: null,
+      dateEntered: fields['Date Entered'],
     });
 
     for (const fee of fees) {
-      insertFee(db, {
-        applicationNumber: appNum,
+      insertCeFee(db, {
+        caseNumber: caseNum,
         description: fee.description,
         amount: fee.amount,
         paid: fee.paid,
@@ -482,8 +545,8 @@ async function fetchAndStoreComplaints(page, db, parcel) {
     }
 
     for (const insp of inspections) {
-      insertInspection(db, {
-        applicationNumber: appNum,
+      insertCeInspection(db, {
+        caseNumber: caseNum,
         inspectionType: insp['Inspection Type'] || insp['Type'] || '',
         requestDate: insp['Request Date'] || insp['Requested'] || '',
         scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
@@ -504,7 +567,7 @@ async function fetchAndStorePermits(page, db, parcel) {
     const { fields, subPermits, fees, inspections } = await fetchFullDetail(page, 'Permit', ref);
     const appNum = fields['Application Number'] || ref;
 
-    insertApplication(db, {
+    insertPermit(db, {
       referenceNumber: appNum,
       parcelNumber: parcel,
       recordType: 'Permit',
@@ -521,7 +584,7 @@ async function fetchAndStorePermits(page, db, parcel) {
     for (const sp of subPermits) {
       insertSubPermit(db, {
         permitNumber: sp.permitNumber,
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         permitType: sp['Permit Type'],
         permitStatus: sp['Permit Status'],
         dateIssued: sp['Date Issued'],
@@ -531,7 +594,7 @@ async function fetchAndStorePermits(page, db, parcel) {
 
     for (const fee of fees) {
       insertFee(db, {
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         description: fee.description,
         amount: fee.amount,
         paid: fee.paid,
@@ -542,7 +605,7 @@ async function fetchAndStorePermits(page, db, parcel) {
 
     for (const insp of inspections) {
       insertInspection(db, {
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         inspectionType: insp['Inspection Type'] || insp['Type'] || '',
         requestDate: insp['Request Date'] || insp['Requested'] || '',
         scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
@@ -563,7 +626,7 @@ async function fetchAndStorePlanning(page, db, parcel) {
     const { fields, fees, inspections } = await fetchFullDetail(page, 'Planning', ref);
     const appNum = fields['Application Number'] || ref;
 
-    insertApplication(db, {
+    insertPermit(db, {
       referenceNumber: appNum,
       parcelNumber: parcel,
       recordType: 'Planning',
@@ -579,7 +642,7 @@ async function fetchAndStorePlanning(page, db, parcel) {
 
     for (const fee of fees) {
       insertFee(db, {
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         description: fee.description,
         amount: fee.amount,
         paid: fee.paid,
@@ -590,7 +653,7 @@ async function fetchAndStorePlanning(page, db, parcel) {
 
     for (const insp of inspections) {
       insertInspection(db, {
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         inspectionType: insp['Inspection Type'] || insp['Type'] || '',
         requestDate: insp['Request Date'] || insp['Requested'] || '',
         scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
@@ -611,7 +674,7 @@ async function fetchAndStoreLicenses(page, db, parcel) {
     const { fields, fees, inspections } = await fetchFullDetail(page, 'License', ref);
     const appNum = fields['License Number'] || ref;
 
-    insertApplication(db, {
+    insertPermit(db, {
       referenceNumber: appNum,
       parcelNumber: parcel,
       recordType: 'License',
@@ -627,7 +690,7 @@ async function fetchAndStoreLicenses(page, db, parcel) {
 
     for (const fee of fees) {
       insertFee(db, {
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         description: fee.description,
         amount: fee.amount,
         paid: fee.paid,
@@ -638,7 +701,7 @@ async function fetchAndStoreLicenses(page, db, parcel) {
 
     for (const insp of inspections) {
       insertInspection(db, {
-        applicationNumber: appNum,
+        referenceNumber: appNum,
         inspectionType: insp['Inspection Type'] || insp['Type'] || '',
         requestDate: insp['Request Date'] || insp['Requested'] || '',
         scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
@@ -907,14 +970,16 @@ async function runAddressMode(opts) {
 function printSummary(db, output) {
   const counts = {
     properties: db.prepare('SELECT COUNT(*) as n FROM properties').get().n,
-    applications: db.prepare('SELECT COUNT(*) as n FROM applications').get().n,
+    ceCases: db.prepare('SELECT COUNT(*) as n FROM code_enforcement').get().n,
+    ceInspections: db.prepare('SELECT COUNT(*) as n FROM ce_inspections').get().n,
+    permits: db.prepare('SELECT COUNT(*) as n FROM permits').get().n,
     subPermits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
     fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
     inspections: db.prepare('SELECT COUNT(*) as n FROM inspections').get().n,
   };
 
   console.log(`\n==================================`);
-  console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections`);
+  console.log(`Done! ${counts.properties} properties, ${counts.ceCases} CE cases, ${counts.permits} permits, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections`);
   console.log(`Database: ${path.resolve(output)}`);
 }
 
