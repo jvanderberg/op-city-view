@@ -2,25 +2,26 @@
 /**
  * Oak Park CityView Portal - Residential Permit Data Exporter
  *
- * Uses Playwright to call CityView portal's internal APIs to discover records,
- * then fetches full detail from each record's StatusReference page.
+ * Exports permit, code enforcement, planning, and license data to SQLite.
  *
  * Data flow:
  *   1. Property LocationSearch API -> address autocomplete (JSON)
  *   2. Property LocateResults API -> parcel number from redirect URL (JSON)
- *   3. Module LocatorResults APIs -> list of reference numbers (JSON + View)
- *   4. StatusReference detail pages -> full record data (displayField extraction)
+ *   3. Module LocatorResults APIs -> list of reference numbers by parcel (JSON)
+ *   4. StatusReference detail pages -> full record data + sub-permits + fees
  *
  * Usage:
- *   node export-permits.js --address "834 N AUSTIN BLVD"
+ *   node export-permits.js --address "1010 S EUCLID AVE"
  *   node export-permits.js --street "GROVE AVE"
  *   node export-permits.js --file addresses.txt
+ *   node export-permits.js --output oakpark.db
  *
  * Environment:
  *   CITYVIEW_EMAIL / CITYVIEW_PASSWORD - Login for authenticated access (permits)
  */
 
 const { chromium } = require('playwright-core');
+const { DatabaseSync } = require('node:sqlite');
 const fs = require('fs');
 const path = require('path');
 
@@ -30,13 +31,64 @@ const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY;
 const cityviewEmail = process.env.CITYVIEW_EMAIL;
 const cityviewPassword = process.env.CITYVIEW_PASSWORD;
 
+// ─── Schema ──────────────────────────────────────────────────────────
+
+function initDatabase(dbPath) {
+  const db = new DatabaseSync(dbPath);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS properties (
+      parcel_number TEXT PRIMARY KEY,
+      address TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS applications (
+      reference_number TEXT PRIMARY KEY,
+      parcel_number TEXT NOT NULL REFERENCES properties(parcel_number),
+      record_type TEXT NOT NULL,  -- 'Permit', 'Code Enforcement', 'Planning', 'License'
+      application_type TEXT,
+      work_class TEXT,
+      status TEXT,
+      description TEXT,
+      application_date TEXT,
+      issued_date TEXT,
+      expiration_date TEXT,
+      date_finaled TEXT,
+      fetched_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS sub_permits (
+      permit_number TEXT PRIMARY KEY,
+      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      permit_type TEXT,
+      permit_status TEXT,
+      date_issued TEXT,
+      expiration_date TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS fees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      description TEXT,
+      amount REAL,
+      paid REAL,
+      owing REAL,
+      date_paid TEXT
+    );
+  `);
+
+  return db;
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
 function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
     addresses: [],
     street: null,
     file: null,
-    output: 'permits-export.csv',
+    output: 'cityview.db',
     delay: 1000,
   };
 
@@ -59,10 +111,10 @@ function parseArgs() {
         break;
       case '--help': case '-h':
         console.log(`Usage:
-  node export-permits.js --address "834 N AUSTIN BLVD"
+  node export-permits.js --address "1010 S EUCLID AVE"
   node export-permits.js --street "GROVE AVE"
   node export-permits.js --file addresses.txt
-  node export-permits.js --output results.csv
+  node export-permits.js --output oakpark.db
   node export-permits.js --delay 2000`);
         process.exit(0);
     }
@@ -75,6 +127,8 @@ function parseArgs() {
 
   return opts;
 }
+
+// ─── Browser ─────────────────────────────────────────────────────────
 
 async function createBrowser() {
   const launchOptions = {
@@ -103,12 +157,11 @@ async function initPage(context) {
 
 async function login(page) {
   if (!cityviewEmail || !cityviewPassword) {
-    console.log('No credentials provided. Running unauthenticated (permits may be unavailable).');
-    console.log('Set CITYVIEW_EMAIL and CITYVIEW_PASSWORD env vars for full access.\n');
+    console.log('No credentials. Set CITYVIEW_EMAIL and CITYVIEW_PASSWORD for full access.\n');
     return false;
   }
 
-  console.log('Logging in to CityView portal...');
+  console.log('Logging in...');
   await page.goto(`${BASE_URL}${PORTAL}/Account/Logon`, { waitUntil: 'networkidle', timeout: 30000 });
   await page.fill('#emailAddress', cityviewEmail);
   await page.fill('#password', cityviewPassword);
@@ -121,16 +174,15 @@ async function login(page) {
 
   const loggedIn = await page.evaluate(() => {
     const body = document.body.innerText;
-    return body.includes('Log Off') || body.includes('Logoff') || !!document.querySelector('a[href*="Logoff"], a[href*="LogOff"]');
+    return body.includes('Sign Out') || body.includes('Log Off') || body.includes('Logoff');
   });
 
-  console.log(loggedIn ? 'Login successful.\n' : 'Login may have failed. Continuing anyway.\n');
+  console.log(loggedIn ? 'Login successful.\n' : 'Login may have failed.\n');
   return loggedIn;
 }
 
-// ─── API helpers ──────────────────────────────────────────────────────
+// ─── API helpers ─────────────────────────────────────────────────────
 
-// Extract indexed field values from LocatorResults View HTML via regex
 function parseViewRefNumbers(viewHtml, idPrefix) {
   const refs = [];
   const re = new RegExp(`id="${idPrefix}(\\d+)" class="inputText"[^>]*>([^<]*)`, 'g');
@@ -139,10 +191,9 @@ function parseViewRefNumbers(viewHtml, idPrefix) {
     const val = m[2].trim();
     if (val) refs.push(val);
   }
-  return [...new Set(refs)]; // deduplicate
+  return [...new Set(refs)];
 }
 
-// Call a module's LocatorResults API with a parcel number
 async function callLocatorByParcel(page, modulePath, parcel) {
   await page.goto(`${BASE_URL}${PORTAL}/${modulePath}/Locator`, { waitUntil: 'networkidle', timeout: 30000 });
   await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
@@ -160,30 +211,82 @@ async function callLocatorByParcel(page, modulePath, parcel) {
   }, { modulePath, searchValue: parcel });
 }
 
-// Extract all displayField label:value pairs from the current page
-async function extractDisplayFields(page) {
-  return page.evaluate(() => {
-    const fields = {};
-    document.querySelectorAll('.displayField').forEach(f => {
-      const label = f.querySelector('label');
-      const value = f.querySelector('.inputText, .fieldData');
-      if (label && value) {
-        const l = label.textContent.trim().replace(/:$/, '');
-        const v = value.textContent.trim();
-        if (l && v) fields[l] = v;
-      }
-    });
-    return fields;
-  });
+async function getModuleRefs(page, modulePath, idPrefix, parcel) {
+  const result = await callLocatorByParcel(page, modulePath, parcel);
+  if (!result || !result.View) return [];
+  return parseViewRefNumbers(result.View, idPrefix);
 }
 
-// Fetch full detail from a StatusReference page
-async function fetchStatusDetail(page, modulePath, referenceNumber) {
+// Extract full detail from a StatusReference page: fields, sub-permits, fees
+async function fetchFullDetail(page, modulePath, referenceNumber) {
   await page.goto(`${BASE_URL}${PORTAL}/${modulePath}/StatusReference?referenceNumber=${encodeURIComponent(referenceNumber)}`, {
     waitUntil: 'networkidle',
     timeout: 30000,
   });
-  return extractDisplayFields(page);
+
+  return page.evaluate(() => {
+    const result = { fields: {}, subPermits: [], fees: [] };
+
+    // Top-level displayFields (application summary)
+    const summaryFieldset = document.querySelector('fieldset');
+    if (summaryFieldset) {
+      summaryFieldset.querySelectorAll('.displayField').forEach(f => {
+        const label = f.querySelector('label');
+        const value = f.querySelector('.inputText, .fieldData');
+        if (label && value) {
+          const l = label.textContent.trim().replace(/:$/, '');
+          const v = value.textContent.trim();
+          if (l && v) result.fields[l] = v;
+        }
+      });
+    }
+
+    // All fieldsets for sub-permits, fees, etc.
+    document.querySelectorAll('fieldset').forEach(fs => {
+      const legend = fs.querySelector('legend');
+      if (!legend) return;
+      const name = legend.textContent.trim();
+
+      // Sub-permit sections: "Permit Number: XXX"
+      if (name.startsWith('Permit Number:')) {
+        const permit = { permitNumber: name.replace('Permit Number:', '').trim() };
+        fs.querySelectorAll('.displayField').forEach(f => {
+          const label = f.querySelector('label');
+          const value = f.querySelector('.inputText, .fieldData');
+          if (label && value) {
+            const l = label.textContent.trim().replace(/:$/, '');
+            const v = value.textContent.trim();
+            if (l && v) permit[l] = v;
+          }
+        });
+        result.subPermits.push(permit);
+      }
+    });
+
+    // Fees table
+    document.querySelectorAll('table').forEach(table => {
+      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+      if (!headers.some(h => h.includes('Fee') || h.includes('Amount'))) return;
+
+      Array.from(table.rows).slice(1).forEach(row => {
+        const cells = Array.from(row.cells).map(c => c.textContent.trim());
+        // Skip header-like rows and total rows
+        if (cells.length < 3) return;
+        if (cells[0].includes('Outstanding') || cells[0].includes('Totals')) return;
+
+        const fee = {
+          description: cells[0] || '',
+          amount: cells[1] || '',
+          paid: cells[2] || '',
+          owing: cells[3] || '',
+          datePaid: cells[4] || '',
+        };
+        if (fee.amount.includes('$')) result.fees.push(fee);
+      });
+    });
+
+    return result;
+  });
 }
 
 // ─── Address search ──────────────────────────────────────────────────
@@ -236,126 +339,183 @@ async function getParcelNumber(page, address) {
   return match ? match[1] : null;
 }
 
+// ─── DB writers ──────────────────────────────────────────────────────
+
+function parseDollar(s) {
+  if (!s) return null;
+  const n = parseFloat(s.replace(/[$,]/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+function nullIfEmpty(s) {
+  return s || null;
+}
+
+function insertProperty(db, parcel, address) {
+  db.prepare(`INSERT OR IGNORE INTO properties (parcel_number, address) VALUES (?, ?)`)
+    .run(parcel, address);
+}
+
+function insertApplication(db, app) {
+  db.prepare(`INSERT OR REPLACE INTO applications
+    (reference_number, parcel_number, record_type, application_type, work_class,
+     status, description, application_date, issued_date, expiration_date, date_finaled)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      app.referenceNumber, app.parcelNumber, app.recordType,
+      nullIfEmpty(app.applicationType), nullIfEmpty(app.workClass),
+      nullIfEmpty(app.status), nullIfEmpty(app.description),
+      nullIfEmpty(app.applicationDate), nullIfEmpty(app.issuedDate),
+      nullIfEmpty(app.expirationDate), nullIfEmpty(app.dateFinaled),
+    );
+}
+
+function insertSubPermit(db, sp) {
+  db.prepare(`INSERT OR REPLACE INTO sub_permits
+    (permit_number, application_number, permit_type, permit_status, date_issued, expiration_date)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(
+      sp.permitNumber, sp.applicationNumber,
+      nullIfEmpty(sp.permitType), nullIfEmpty(sp.permitStatus),
+      nullIfEmpty(sp.dateIssued), nullIfEmpty(sp.expirationDate),
+    );
+}
+
+function insertFee(db, fee) {
+  db.prepare(`INSERT INTO fees
+    (application_number, description, amount, paid, owing, date_paid)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(
+      fee.applicationNumber, nullIfEmpty(fee.description),
+      parseDollar(fee.amount), parseDollar(fee.paid),
+      parseDollar(fee.owing), nullIfEmpty(fee.datePaid),
+    );
+}
+
 // ─── Module fetchers ─────────────────────────────────────────────────
 
-// Get all unique reference numbers for a module by searching by parcel
-async function getModuleRefs(page, modulePath, idPrefix, parcel) {
-  const result = await callLocatorByParcel(page, modulePath, parcel);
-  if (!result || !result.View) return [];
-  return parseViewRefNumbers(result.View, idPrefix);
-}
-
-async function fetchComplaints(page, parcel) {
+async function fetchAndStoreComplaints(page, db, parcel) {
   const refs = await getModuleRefs(page, 'CodeEnforcement', 'caseNumber', parcel);
-  const records = [];
   for (const ref of refs) {
-    const fields = await fetchStatusDetail(page, 'CodeEnforcement', ref);
-    records.push({
-      RecordType: 'Code Enforcement',
-      ReferenceNumber: fields['Case Number'] || ref,
-      Type: fields['Complaint Type'] || '',
-      Status: fields['Status'] || '',
-      Date: fields['Date Entered'] || '',
-      Description: fields['Description'] || '',
+    const { fields } = await fetchFullDetail(page, 'CodeEnforcement', ref);
+    insertApplication(db, {
+      referenceNumber: fields['Case Number'] || ref,
+      parcelNumber: parcel,
+      recordType: 'Code Enforcement',
+      applicationType: fields['Complaint Type'],
+      workClass: null,
+      status: fields['Status'],
+      description: fields['Description'],
+      applicationDate: fields['Date Entered'],
+      issuedDate: null,
+      expirationDate: null,
+      dateFinaled: null,
     });
   }
-  return records;
+  return refs.length;
 }
 
-async function fetchPermits(page, parcel) {
+async function fetchAndStorePermits(page, db, parcel) {
   const refs = await getModuleRefs(page, 'Permit', 'permitNumber', parcel);
-  const records = [];
   for (const ref of refs) {
-    const fields = await fetchStatusDetail(page, 'Permit', ref);
-    records.push({
-      RecordType: 'Permit',
-      ReferenceNumber: fields['Application Number'] || ref,
-      Type: fields['Application Type'] || '',
-      WorkClass: fields['Category of Work'] || '',
-      Status: fields['Application Status'] || '',
-      DateIssued: fields['Issued Date'] || fields['Date Issued'] || '',
-      ApplicationDate: fields['Application Date'] || '',
-      ExpirationDate: fields['Expiration Date'] || '',
-      DateFinaled: fields['Date Finaled'] || '',
-      PermitType: fields['Permit Type'] || '',
-      PermitStatus: fields['Permit Status'] || '',
-      Description: fields['Description of Work'] || '',
+    const { fields, subPermits, fees } = await fetchFullDetail(page, 'Permit', ref);
+    const appNum = fields['Application Number'] || ref;
+
+    insertApplication(db, {
+      referenceNumber: appNum,
+      parcelNumber: parcel,
+      recordType: 'Permit',
+      applicationType: fields['Application Type'],
+      workClass: fields['Category of Work'],
+      status: fields['Application Status'],
+      description: fields['Description of Work'],
+      applicationDate: fields['Application Date'],
+      issuedDate: fields['Issued Date'] || fields['Date Issued'],
+      expirationDate: fields['Expiration Date'],
+      dateFinaled: fields['Date Finaled'],
     });
+
+    for (const sp of subPermits) {
+      insertSubPermit(db, {
+        permitNumber: sp.permitNumber,
+        applicationNumber: appNum,
+        permitType: sp['Permit Type'],
+        permitStatus: sp['Permit Status'],
+        dateIssued: sp['Date Issued'],
+        expirationDate: sp['Expiration Date'],
+      });
+    }
+
+    for (const fee of fees) {
+      insertFee(db, {
+        applicationNumber: appNum,
+        description: fee.description,
+        amount: fee.amount,
+        paid: fee.paid,
+        owing: fee.owing,
+        datePaid: fee.datePaid,
+      });
+    }
   }
-  return records;
+  return refs.length;
 }
 
-async function fetchPlanning(page, parcel) {
+async function fetchAndStorePlanning(page, db, parcel) {
   const refs = await getModuleRefs(page, 'Planning', 'applicationNumber', parcel);
-  const records = [];
   for (const ref of refs) {
-    const fields = await fetchStatusDetail(page, 'Planning', ref);
-    records.push({
-      RecordType: 'Planning',
-      ReferenceNumber: fields['Application Number'] || ref,
-      Type: fields['Application Type'] || fields['Type'] || '',
-      Status: fields['Status'] || fields['Application Status'] || '',
-      Date: fields['Date Entered'] || fields['Application Date'] || '',
-      Description: fields['Description'] || '',
+    const { fields } = await fetchFullDetail(page, 'Planning', ref);
+    insertApplication(db, {
+      referenceNumber: fields['Application Number'] || ref,
+      parcelNumber: parcel,
+      recordType: 'Planning',
+      applicationType: fields['Application Type'] || fields['Type'],
+      workClass: null,
+      status: fields['Status'] || fields['Application Status'],
+      description: fields['Description'],
+      applicationDate: fields['Date Entered'] || fields['Application Date'],
+      issuedDate: null,
+      expirationDate: null,
+      dateFinaled: null,
     });
   }
-  return records;
+  return refs.length;
 }
 
-async function fetchLicenses(page, parcel) {
+async function fetchAndStoreLicenses(page, db, parcel) {
   const refs = await getModuleRefs(page, 'License', 'licenseNumber', parcel);
-  const records = [];
   for (const ref of refs) {
-    const fields = await fetchStatusDetail(page, 'License', ref);
-    records.push({
-      RecordType: 'License',
-      ReferenceNumber: fields['License Number'] || ref,
-      Type: fields['License Type'] || fields['Type'] || '',
-      Status: fields['Status'] || '',
-      Date: fields['Date Entered'] || fields['Issue Date'] || '',
-      Description: fields['Description'] || '',
+    const { fields } = await fetchFullDetail(page, 'License', ref);
+    insertApplication(db, {
+      referenceNumber: fields['License Number'] || ref,
+      parcelNumber: parcel,
+      recordType: 'License',
+      applicationType: fields['License Type'] || fields['Type'],
+      workClass: null,
+      status: fields['Status'],
+      description: fields['Description'],
+      applicationDate: fields['Date Entered'] || fields['Issue Date'],
+      issuedDate: null,
+      expirationDate: null,
+      dateFinaled: null,
     });
   }
-  return records;
+  return refs.length;
 }
 
-// ─── CSV output ──────────────────────────────────────────────────────
-
-const CSV_HEADERS = [
-  'Address', 'ParcelNumber', 'RecordType', 'ReferenceNumber', 'Type',
-  'WorkClass', 'Status', 'ApplicationDate', 'DateIssued', 'ExpirationDate',
-  'DateFinaled', 'PermitType', 'PermitStatus', 'Date', 'Description',
-];
-
-function escapeCSV(val) {
-  if (val == null) return '';
-  const s = String(val);
-  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
-}
-
-function writeCSVHeader(filePath) {
-  fs.writeFileSync(filePath, CSV_HEADERS.join(',') + '\n');
-}
-
-function appendCSVRows(filePath, rows) {
-  const lines = rows.map(row => CSV_HEADERS.map(h => escapeCSV(row[h])).join(','));
-  fs.appendFileSync(filePath, lines.join('\n') + '\n');
-}
+// ─── Main ────────────────────────────────────────────────────────────
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-// ─── Main ────────────────────────────────────────────────────────────
 
 async function main() {
   const opts = parseArgs();
 
   console.log('Oak Park CityView Permit Exporter');
   console.log('==================================\n');
+
+  const db = initDatabase(opts.output);
+  console.log(`Database: ${path.resolve(opts.output)}\n`);
 
   const { browser, context } = await createBrowser();
 
@@ -365,7 +525,6 @@ async function main() {
 
     const isAuthenticated = await login(page);
 
-    // Navigate to Property search
     await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
 
@@ -382,11 +541,7 @@ async function main() {
         const results = await searchAddresses(page, term);
         let newCount = 0;
         for (const addr of results) {
-          if (!seen.has(addr)) {
-            seen.add(addr);
-            addresses.push(addr);
-            newCount++;
-          }
+          if (!seen.has(addr)) { seen.add(addr); addresses.push(addr); newCount++; }
         }
         if (newCount > 0) console.log(`  "${term}" -> ${results.length} results (${newCount} new)`);
         await sleep(300);
@@ -397,11 +552,7 @@ async function main() {
             const subResults = await searchAddresses(page, subTerm);
             let subNew = 0;
             for (const addr of subResults) {
-              if (!seen.has(addr)) {
-                seen.add(addr);
-                addresses.push(addr);
-                subNew++;
-              }
+              if (!seen.has(addr)) { seen.add(addr); addresses.push(addr); subNew++; }
             }
             if (subNew > 0) console.log(`  "${subTerm}" -> ${subResults.length} results (${subNew} new)`);
             await sleep(300);
@@ -417,64 +568,40 @@ async function main() {
       return;
     }
 
-    writeCSVHeader(opts.output);
-    console.log(`Writing results to: ${opts.output}\n`);
-
     let processed = 0;
-    let totalRecords = 0;
 
     for (const address of addresses) {
       processed++;
-      console.log(`[${processed}/${addresses.length}] Processing: ${address}`);
+      console.log(`[${processed}/${addresses.length}] ${address}`);
 
       try {
-        // Get parcel number via Property API
         await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
         await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
         const parcel = await getParcelNumber(page, address);
 
         if (!parcel) {
           console.log('  -> No property found');
-          appendCSVRows(opts.output, [{ Address: address, RecordType: 'Not Found' }]);
           continue;
         }
 
+        insertProperty(db, parcel, address);
         console.log(`  -> Parcel: ${parcel}`);
-        const baseFields = { Address: address, ParcelNumber: parcel };
-        const rows = [];
 
-        // Code Enforcement via API + StatusReference detail
-        const complaints = await fetchComplaints(page, parcel);
-        console.log(`  -> ${complaints.length} code enforcement records`);
-        for (const c of complaints) rows.push({ ...baseFields, ...c });
+        const ce = await fetchAndStoreComplaints(page, db, parcel);
+        if (ce > 0) console.log(`  -> ${ce} code enforcement`);
 
-        // Permits via API + StatusReference detail (requires auth)
         if (isAuthenticated) {
-          const permits = await fetchPermits(page, parcel);
-          console.log(`  -> ${permits.length} permit records`);
-          for (const p of permits) rows.push({ ...baseFields, ...p });
+          const permits = await fetchAndStorePermits(page, db, parcel);
+          if (permits > 0) console.log(`  -> ${permits} permits`);
         }
 
-        // Planning via API + StatusReference detail
-        const planning = await fetchPlanning(page, parcel);
-        if (planning.length > 0) console.log(`  -> ${planning.length} planning records`);
-        for (const p of planning) rows.push({ ...baseFields, ...p });
+        const planning = await fetchAndStorePlanning(page, db, parcel);
+        if (planning > 0) console.log(`  -> ${planning} planning`);
 
-        // Licenses via API + StatusReference detail
-        const licenses = await fetchLicenses(page, parcel);
-        if (licenses.length > 0) console.log(`  -> ${licenses.length} license records`);
-        for (const l of licenses) rows.push({ ...baseFields, ...l });
-
-        if (rows.length === 0) {
-          rows.push({ ...baseFields, RecordType: 'None' });
-        }
-
-        appendCSVRows(opts.output, rows);
-        totalRecords += rows.length;
+        const licenses = await fetchAndStoreLicenses(page, db, parcel);
+        if (licenses > 0) console.log(`  -> ${licenses} licenses`);
       } catch (e) {
         console.log(`  -> Error: ${e.message}`);
-        appendCSVRows(opts.output, [{ Address: address, RecordType: 'Error', Description: e.message }]);
-
         try {
           page = await initPage(context);
           if (isAuthenticated) await login(page);
@@ -486,11 +613,20 @@ async function main() {
       if (processed < addresses.length) await sleep(opts.delay);
     }
 
+    // Summary
+    const counts = {
+      properties: db.prepare('SELECT COUNT(*) as n FROM properties').get().n,
+      applications: db.prepare('SELECT COUNT(*) as n FROM applications').get().n,
+      subPermits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
+      fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
+    };
+
     console.log(`\n==================================`);
-    console.log(`Done! Processed ${processed} addresses, exported ${totalRecords} records.`);
-    console.log(`Output: ${path.resolve(opts.output)}`);
+    console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees`);
+    console.log(`Database: ${path.resolve(opts.output)}`);
   } finally {
     await browser.close();
+    db.close();
   }
 }
 
