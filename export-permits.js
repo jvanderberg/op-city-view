@@ -21,6 +21,8 @@ const path = require('path');
 const BASE_URL = 'https://villageview.oak-park.us';
 const PORTAL = '/CityViewPortal';
 const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY;
+const cityviewEmail = process.env.CITYVIEW_EMAIL;
+const cityviewPassword = process.env.CITYVIEW_PASSWORD;
 
 // Parse command-line arguments
 function parseArgs() {
@@ -92,6 +94,181 @@ async function initPage(context) {
   await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
   await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
   return page;
+}
+
+// Login to CityView portal for authenticated access (permits, etc.)
+async function login(page) {
+  if (!cityviewEmail || !cityviewPassword) {
+    console.log('No credentials provided. Running unauthenticated (permits may be unavailable).');
+    console.log('Set CITYVIEW_EMAIL and CITYVIEW_PASSWORD env vars for full access.\n');
+    return false;
+  }
+
+  console.log('Logging in to CityView portal...');
+  await page.goto(`${BASE_URL}${PORTAL}/Account/Logon`, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.fill('#emailAddress', cityviewEmail);
+  await page.fill('#password', cityviewPassword);
+
+  // Click login and wait for either navigation or response
+  await Promise.all([
+    page.waitForURL((url) => !url.href.includes('/Account/Logon'), { timeout: 30000 }).catch(() => {}),
+    page.click('#bnext'),
+  ]);
+
+  // Give the page time to settle
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+  // Check if login succeeded by looking for a logout link or user element
+  const loggedIn = await page.evaluate(() => {
+    const body = document.body.innerText;
+    return body.includes('Log Off') || body.includes('Logoff') || !!document.querySelector('a[href*="Logoff"], a[href*="LogOff"]');
+  });
+
+  if (loggedIn) {
+    console.log('Login successful.\n');
+  } else {
+    console.log('Login may have failed. Continuing anyway.\n');
+  }
+  return loggedIn;
+}
+
+// Search permits using the Permit Locator API (requires authentication)
+async function searchPermits(page, address) {
+  // Navigate to Permit Locator to establish context
+  await page.goto(`${BASE_URL}${PORTAL}/Permit/Locator`, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+
+  // Use the Permit autocomplete API to search
+  const searchResults = await page.evaluate((term) => {
+    return new Promise((resolve) => {
+      const token = jQuery('input[name="__RequestVerificationToken"]').val();
+      jQuery.ajax({
+        type: 'POST',
+        url: '/CityViewPortal/Permit/PermitSearch',
+        dataType: 'json',
+        headers: { __RequestVerificationToken: token },
+        data: {
+          term: term,
+          returnInactiveAddresses: false,
+          module: '',
+          returnParcelNumbers: true,
+          appealPeriodStatusesOnly: false,
+          returnParksRoadsAndTrails: false,
+          locationCodeToAutosuggest: '',
+          isIntermentSearch: false,
+        },
+        success: (data) => {
+          let results = typeof data === 'string' ? JSON.parse(data) : data;
+          if (typeof results === 'string') results = JSON.parse(results);
+          resolve(results);
+        },
+        error: (xhr) => resolve([]),
+      });
+    });
+  }, address);
+
+  if (!searchResults || searchResults.length === 0) return [];
+
+  // Pick the best match (exact or first)
+  const upperAddr = address.toUpperCase();
+  const match = searchResults.find(r => r.toUpperCase().includes(upperAddr)) || searchResults[0];
+
+  // Get locator results for this address
+  const locateResult = await page.evaluate((addr) => {
+    return new Promise((resolve) => {
+      jQuery.ajax({
+        type: 'GET',
+        url: '/CityViewPortal/Permit/LocatorResults',
+        data: { searchValue: addr },
+        success: (data) => resolve(data),
+        error: () => resolve(null),
+      });
+    });
+  }, match);
+
+  if (!locateResult) return [];
+
+  // If we get a redirect URL, navigate to it and extract the permit list
+  if (locateResult.RedirectUrl) {
+    await page.goto(`${BASE_URL}${locateResult.RedirectUrl}`, { waitUntil: 'networkidle', timeout: 30000 });
+    return extractPermitTableFromPage(page);
+  }
+
+  // If HTML content is returned directly, parse it
+  if (typeof locateResult === 'string' || locateResult.Html) {
+    const html = locateResult.Html || locateResult;
+    return parsePermitLocatorHtml(page, html);
+  }
+
+  return [];
+}
+
+// Extract permits from the Permit Locator results page
+async function extractPermitTableFromPage(page) {
+  return page.evaluate(() => {
+    const permits = [];
+    const tables = document.querySelectorAll('table');
+
+    for (const table of tables) {
+      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+      if (!headers.some(h => h.includes('Application') || h.includes('Permit'))) continue;
+
+      let lastPermit = null;
+      Array.from(table.rows).slice(1).forEach(row => {
+        const cells = Array.from(row.cells).map(c => c.textContent.trim());
+        const fullText = cells.join(' ');
+
+        // Description/sub-rows (like "Permits: Building, Electric")
+        if (cells.length < headers.length || fullText.includes('Permits:') || fullText.includes('Description:')) {
+          if (lastPermit) {
+            const descText = fullText.replace(/^[\s]*(Permits|Description):[\s]*/i, '').replace(/\s+/g, ' ').trim();
+            lastPermit.Description = lastPermit.Description ? `${lastPermit.Description}; ${descText}` : descText;
+          }
+          return;
+        }
+
+        const rowData = {};
+        headers.forEach((h, i) => { rowData[h] = cells[i] || ''; });
+        lastPermit = rowData;
+        permits.push(rowData);
+      });
+    }
+    return permits;
+  });
+}
+
+// Parse permit locator HTML response
+async function parsePermitLocatorHtml(page, html) {
+  return page.evaluate((htmlStr) => {
+    const div = document.createElement('div');
+    div.innerHTML = htmlStr;
+    const permits = [];
+    const links = div.querySelectorAll('a[href*="Permit"]');
+    const rows = div.querySelectorAll('tr, .result-row');
+
+    // Try to find a table structure
+    const tables = div.querySelectorAll('table');
+    for (const table of tables) {
+      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+      let lastPermit = null;
+      Array.from(table.rows).slice(1).forEach(row => {
+        const cells = Array.from(row.cells).map(c => c.textContent.trim());
+        const fullText = cells.join(' ');
+        if (cells.length < headers.length || fullText.includes('Permits:') || fullText.includes('Description:')) {
+          if (lastPermit) {
+            const descText = fullText.replace(/^[\s]*(Permits|Description):[\s]*/i, '').replace(/\s+/g, ' ').trim();
+            lastPermit.Description = lastPermit.Description ? `${lastPermit.Description}; ${descText}` : descText;
+          }
+          return;
+        }
+        const rowData = {};
+        headers.forEach((h, i) => { rowData[h] = cells[i] || ''; });
+        lastPermit = rowData;
+        permits.push(rowData);
+      });
+    }
+    return permits;
+  }, html);
 }
 
 // Search for addresses matching a term
@@ -291,14 +468,20 @@ function flattenToCSVRows(address, data) {
 
   // Add permit records
   data.permits.forEach(p => {
+    const type = p['Type'] || p['Permit Type'] || '';
+    const workClass = p['Work Class'] || '';
+    const fullType = workClass ? `${type} - ${workClass}` : type;
+    let desc = (p['Description'] || p['Work Description'] || '').replace(/[\n\r]+/g, ' ').trim();
+    // Clean up "Permits: X, Y Description: actual text" pattern
+    desc = desc.replace(/^Permits:\s*[^]*?\s*Description:\s*/i, '').trim();
     rows.push({
       ...baseFields,
       RecordType: 'Permit',
       ReferenceNumber: p['Permit Number'] || p['Application Number'] || '',
-      Type: p['Type'] || p['Permit Type'] || '',
+      Type: fullType,
       Status: p['Status'] || '',
-      Date: p['Date Entered'] || p['Date'] || p['Application Date'] || '',
-      Description: (p['Description'] || p['Work Description'] || '').replace(/[\n\r]+/g, ' ').trim(),
+      Date: p['Date Issued'] || p['Date Entered'] || p['Date'] || p['Application Date'] || '',
+      Description: desc,
     });
   });
 
@@ -393,6 +576,13 @@ async function main() {
     let page = await initPage(context);
     console.log('Connected to CityView portal.\n');
 
+    // Login if credentials are available
+    const isAuthenticated = await login(page);
+
+    // Navigate back to Property search after login
+    await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+
     let addresses = [...opts.addresses];
 
     // If street search, find all addresses on that street using multiple prefix queries
@@ -473,8 +663,37 @@ async function main() {
           continue;
         }
 
-        // Extract property data
+        // Extract property data from PropertyReview page
         const data = await extractPropertyData(page, reviewUrl);
+
+        // If authenticated, also fetch permits via the Permit Locator API for richer data
+        if (isAuthenticated) {
+          try {
+            const permitData = await searchPermits(page, address);
+            if (permitData.length > 0) {
+              // Merge: use Permit Locator data as primary, add any unique records from PropertyReview
+              const locatorRefs = new Set(permitData.map(p => p['Permit Number'] || p['Application Number']));
+              const uniqueFromProperty = data.permits.filter(p => {
+                const ref = p['Permit Number'] || p['Application Number'] || '';
+                return ref && !locatorRefs.has(ref);
+              });
+              data.permits = [...permitData, ...uniqueFromProperty];
+              console.log(`  -> Permit Locator: ${permitData.length} permit records found`);
+            }
+          } catch (e) {
+            console.log(`  -> Permit Locator error: ${e.message}`);
+          }
+        }
+
+        // Deduplicate permits by reference number
+        const seenPermitRefs = new Set();
+        data.permits = data.permits.filter(p => {
+          const ref = p['Permit Number'] || p['Application Number'] || '';
+          if (!ref || seenPermitRefs.has(ref)) return false;
+          seenPermitRefs.add(ref);
+          return true;
+        });
+
         const totalForProperty = data.complaints.length + data.permits.length + data.engineeringPermits.length + data.licenses.length + data.planningApps.length;
         console.log(`  -> Parcel: ${data.parcelNumber} | ${totalForProperty} records (${data.complaints.length} complaints, ${data.permits.length} permits, ${data.engineeringPermits.length} eng permits, ${data.licenses.length} licenses, ${data.planningApps.length} planning)`);
 
