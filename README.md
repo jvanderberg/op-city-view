@@ -62,6 +62,8 @@ The SQLite database has four tables in a normalized relational structure:
 ```
 properties ──< applications ──< sub_permits
                             ──< fees
+                            ──< inspections
+                            ──< documents
 ```
 
 ### `properties`
@@ -124,6 +126,36 @@ outstanding fees.
 | `owing` | REAL | Amount still owing |
 | `date_paid` | TEXT | Date the fee was paid, or `Not Paid` |
 
+### `inspections`
+
+Inspection records associated with an application. Includes scheduled, completed,
+and pending inspections from all modules (permits, code enforcement, etc.).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Auto-increment ID |
+| `application_number` | TEXT FK | References `applications.reference_number` |
+| `inspection_type` | TEXT | Type of inspection (e.g. `Final`, `Rough-In`, `Neighborhood Walk`) |
+| `request_date` | TEXT | Date inspection was requested |
+| `scheduled_date` | TEXT | Date inspection is/was scheduled |
+| `completed_date` | TEXT | Date inspection was completed |
+| `inspector` | TEXT | Name of the inspector |
+| `result` | TEXT | Inspection result (e.g. `Pass`, `Fail`, `Violation`) |
+| `comments` | TEXT | Inspector notes or comments |
+
+### `documents`
+
+Documents and images attached to an application. Includes violation notices,
+inspection results, citations, photos, and other uploaded files.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Auto-increment ID |
+| `application_number` | TEXT FK | References `applications.reference_number` |
+| `document_name` | TEXT | File/document name (e.g. `Inspection Results - Violations`, `661 SOUTH BLVD CITATION`) |
+| `document_type` | TEXT | Document category/type |
+| `document_date` | TEXT | Date the document was uploaded or created |
+
 ## Example Queries
 
 ```sql
@@ -150,6 +182,20 @@ SELECT p.address, a.reference_number, a.application_type, a.description
 FROM applications a
 JOIN properties p ON p.parcel_number = a.parcel_number
 WHERE a.record_type = 'Code Enforcement' AND a.status = 'Open';
+
+-- Violation-related documents for a property
+SELECT p.address, a.reference_number, d.document_name, d.document_date
+FROM documents d
+JOIN applications a ON a.reference_number = d.application_number
+JOIN properties p ON p.parcel_number = a.parcel_number
+WHERE d.document_name LIKE '%violation%' OR d.document_name LIKE '%citation%';
+
+-- Failed inspections
+SELECT p.address, a.reference_number, i.inspection_type, i.completed_date, i.result, i.comments
+FROM inspections i
+JOIN applications a ON a.reference_number = i.application_number
+JOIN properties p ON p.parcel_number = a.parcel_number
+WHERE i.result LIKE '%Fail%' OR i.result LIKE '%Violation%';
 ```
 
 ## How It Works

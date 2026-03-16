@@ -75,6 +75,26 @@ function initDatabase(dbPath) {
       owing REAL,
       date_paid TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS inspections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      inspection_type TEXT,
+      request_date TEXT,
+      scheduled_date TEXT,
+      completed_date TEXT,
+      inspector TEXT,
+      result TEXT,
+      comments TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS documents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      application_number TEXT NOT NULL REFERENCES applications(reference_number),
+      document_name TEXT,
+      document_type TEXT,
+      document_date TEXT
+    );
   `);
 
   return db;
@@ -225,7 +245,7 @@ async function fetchFullDetail(page, modulePath, referenceNumber) {
   });
 
   return page.evaluate(() => {
-    const result = { fields: {}, subPermits: [], fees: [] };
+    const result = { fields: {}, subPermits: [], fees: [], inspections: [], documents: [] };
 
     // Top-level displayFields (application summary)
     const summaryFieldset = document.querySelector('fieldset');
@@ -270,7 +290,6 @@ async function fetchFullDetail(page, modulePath, referenceNumber) {
 
       Array.from(table.rows).slice(1).forEach(row => {
         const cells = Array.from(row.cells).map(c => c.textContent.trim());
-        // Skip header-like rows and total rows
         if (cells.length < 3) return;
         if (cells[0].includes('Outstanding') || cells[0].includes('Totals')) return;
 
@@ -284,6 +303,62 @@ async function fetchFullDetail(page, modulePath, referenceNumber) {
         if (fee.amount.includes('$')) result.fees.push(fee);
       });
     });
+
+    // Inspections table — look for tables with inspection-related headers
+    document.querySelectorAll('table').forEach(table => {
+      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim().toLowerCase());
+      const isInspectionTable = headers.some(h =>
+        h.includes('inspection') || h.includes('inspector') || h.includes('result')
+      ) && !headers.some(h => h.includes('fee') || h.includes('amount'));
+      if (!isInspectionTable) return;
+
+      const headerNames = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+      Array.from(table.rows).slice(1).forEach(row => {
+        const cells = Array.from(row.cells).map(c => c.textContent.trim());
+        if (cells.length < 2) return;
+        // Map cells to header names
+        const entry = {};
+        headerNames.forEach((h, i) => { if (cells[i]) entry[h] = cells[i]; });
+        result.inspections.push(entry);
+      });
+    });
+
+    // Documents table — look for tables with document-related headers or within Documents fieldsets
+    document.querySelectorAll('fieldset').forEach(fs => {
+      const legend = fs.querySelector('legend');
+      if (!legend) return;
+      const name = legend.textContent.trim().toLowerCase();
+      if (!name.includes('document') && !name.includes('image')) return;
+
+      fs.querySelectorAll('table').forEach(table => {
+        const headerNames = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+        Array.from(table.rows).slice(1).forEach(row => {
+          const cells = Array.from(row.cells).map(c => c.textContent.trim());
+          if (cells.length < 1) return;
+          const entry = {};
+          headerNames.forEach((h, i) => { if (cells[i]) entry[h] = cells[i]; });
+          result.documents.push(entry);
+        });
+      });
+    });
+
+    // Also check for document tables outside fieldsets
+    if (result.documents.length === 0) {
+      document.querySelectorAll('table').forEach(table => {
+        const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim().toLowerCase());
+        const isDocTable = headers.some(h => h.includes('document') || h.includes('file'));
+        if (!isDocTable) return;
+
+        const headerNames = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+        Array.from(table.rows).slice(1).forEach(row => {
+          const cells = Array.from(row.cells).map(c => c.textContent.trim());
+          if (cells.length < 1) return;
+          const entry = {};
+          headerNames.forEach((h, i) => { if (cells[i]) entry[h] = cells[i]; });
+          result.documents.push(entry);
+        });
+      });
+    }
 
     return result;
   });
@@ -392,14 +467,41 @@ function insertFee(db, fee) {
     );
 }
 
+function insertInspection(db, insp) {
+  db.prepare(`INSERT INTO inspections
+    (application_number, inspection_type, request_date, scheduled_date,
+     completed_date, inspector, result, comments)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      insp.applicationNumber,
+      nullIfEmpty(insp.inspectionType), nullIfEmpty(insp.requestDate),
+      nullIfEmpty(insp.scheduledDate), nullIfEmpty(insp.completedDate),
+      nullIfEmpty(insp.inspector), nullIfEmpty(insp.result),
+      nullIfEmpty(insp.comments),
+    );
+}
+
+function insertDocument(db, doc) {
+  db.prepare(`INSERT INTO documents
+    (application_number, document_name, document_type, document_date)
+    VALUES (?, ?, ?, ?)`)
+    .run(
+      doc.applicationNumber,
+      nullIfEmpty(doc.documentName), nullIfEmpty(doc.documentType),
+      nullIfEmpty(doc.documentDate),
+    );
+}
+
 // ─── Module fetchers ─────────────────────────────────────────────────
 
 async function fetchAndStoreComplaints(page, db, parcel) {
   const refs = await getModuleRefs(page, 'CodeEnforcement', 'caseNumber', parcel);
   for (const ref of refs) {
-    const { fields } = await fetchFullDetail(page, 'CodeEnforcement', ref);
+    const { fields, fees, inspections, documents } = await fetchFullDetail(page, 'CodeEnforcement', ref);
+    const appNum = fields['Case Number'] || ref;
+
     insertApplication(db, {
-      referenceNumber: fields['Case Number'] || ref,
+      referenceNumber: appNum,
       parcelNumber: parcel,
       recordType: 'Code Enforcement',
       applicationType: fields['Complaint Type'],
@@ -411,6 +513,39 @@ async function fetchAndStoreComplaints(page, db, parcel) {
       expirationDate: null,
       dateFinaled: null,
     });
+
+    for (const fee of fees) {
+      insertFee(db, {
+        applicationNumber: appNum,
+        description: fee.description,
+        amount: fee.amount,
+        paid: fee.paid,
+        owing: fee.owing,
+        datePaid: fee.datePaid,
+      });
+    }
+
+    for (const insp of inspections) {
+      insertInspection(db, {
+        applicationNumber: appNum,
+        inspectionType: insp['Inspection Type'] || insp['Type'] || '',
+        requestDate: insp['Request Date'] || insp['Requested'] || '',
+        scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
+        completedDate: insp['Completed Date'] || insp['Completed'] || insp['Date'] || '',
+        inspector: insp['Inspector'] || '',
+        result: insp['Result'] || insp['Status'] || '',
+        comments: insp['Comments'] || insp['Notes'] || '',
+      });
+    }
+
+    for (const doc of documents) {
+      insertDocument(db, {
+        applicationNumber: appNum,
+        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
+        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
+        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
+      });
+    }
   }
   return refs.length;
 }
@@ -418,7 +553,7 @@ async function fetchAndStoreComplaints(page, db, parcel) {
 async function fetchAndStorePermits(page, db, parcel) {
   const refs = await getModuleRefs(page, 'Permit', 'permitNumber', parcel);
   for (const ref of refs) {
-    const { fields, subPermits, fees } = await fetchFullDetail(page, 'Permit', ref);
+    const { fields, subPermits, fees, inspections, documents } = await fetchFullDetail(page, 'Permit', ref);
     const appNum = fields['Application Number'] || ref;
 
     insertApplication(db, {
@@ -456,6 +591,28 @@ async function fetchAndStorePermits(page, db, parcel) {
         datePaid: fee.datePaid,
       });
     }
+
+    for (const insp of inspections) {
+      insertInspection(db, {
+        applicationNumber: appNum,
+        inspectionType: insp['Inspection Type'] || insp['Type'] || '',
+        requestDate: insp['Request Date'] || insp['Requested'] || '',
+        scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
+        completedDate: insp['Completed Date'] || insp['Completed'] || insp['Date'] || '',
+        inspector: insp['Inspector'] || '',
+        result: insp['Result'] || insp['Status'] || '',
+        comments: insp['Comments'] || insp['Notes'] || '',
+      });
+    }
+
+    for (const doc of documents) {
+      insertDocument(db, {
+        applicationNumber: appNum,
+        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
+        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
+        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
+      });
+    }
   }
   return refs.length;
 }
@@ -463,9 +620,11 @@ async function fetchAndStorePermits(page, db, parcel) {
 async function fetchAndStorePlanning(page, db, parcel) {
   const refs = await getModuleRefs(page, 'Planning', 'applicationNumber', parcel);
   for (const ref of refs) {
-    const { fields } = await fetchFullDetail(page, 'Planning', ref);
+    const { fields, fees, inspections, documents } = await fetchFullDetail(page, 'Planning', ref);
+    const appNum = fields['Application Number'] || ref;
+
     insertApplication(db, {
-      referenceNumber: fields['Application Number'] || ref,
+      referenceNumber: appNum,
       parcelNumber: parcel,
       recordType: 'Planning',
       applicationType: fields['Application Type'] || fields['Type'],
@@ -477,6 +636,39 @@ async function fetchAndStorePlanning(page, db, parcel) {
       expirationDate: null,
       dateFinaled: null,
     });
+
+    for (const fee of fees) {
+      insertFee(db, {
+        applicationNumber: appNum,
+        description: fee.description,
+        amount: fee.amount,
+        paid: fee.paid,
+        owing: fee.owing,
+        datePaid: fee.datePaid,
+      });
+    }
+
+    for (const insp of inspections) {
+      insertInspection(db, {
+        applicationNumber: appNum,
+        inspectionType: insp['Inspection Type'] || insp['Type'] || '',
+        requestDate: insp['Request Date'] || insp['Requested'] || '',
+        scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
+        completedDate: insp['Completed Date'] || insp['Completed'] || insp['Date'] || '',
+        inspector: insp['Inspector'] || '',
+        result: insp['Result'] || insp['Status'] || '',
+        comments: insp['Comments'] || insp['Notes'] || '',
+      });
+    }
+
+    for (const doc of documents) {
+      insertDocument(db, {
+        applicationNumber: appNum,
+        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
+        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
+        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
+      });
+    }
   }
   return refs.length;
 }
@@ -484,9 +676,11 @@ async function fetchAndStorePlanning(page, db, parcel) {
 async function fetchAndStoreLicenses(page, db, parcel) {
   const refs = await getModuleRefs(page, 'License', 'licenseNumber', parcel);
   for (const ref of refs) {
-    const { fields } = await fetchFullDetail(page, 'License', ref);
+    const { fields, fees, inspections, documents } = await fetchFullDetail(page, 'License', ref);
+    const appNum = fields['License Number'] || ref;
+
     insertApplication(db, {
-      referenceNumber: fields['License Number'] || ref,
+      referenceNumber: appNum,
       parcelNumber: parcel,
       recordType: 'License',
       applicationType: fields['License Type'] || fields['Type'],
@@ -498,6 +692,39 @@ async function fetchAndStoreLicenses(page, db, parcel) {
       expirationDate: null,
       dateFinaled: null,
     });
+
+    for (const fee of fees) {
+      insertFee(db, {
+        applicationNumber: appNum,
+        description: fee.description,
+        amount: fee.amount,
+        paid: fee.paid,
+        owing: fee.owing,
+        datePaid: fee.datePaid,
+      });
+    }
+
+    for (const insp of inspections) {
+      insertInspection(db, {
+        applicationNumber: appNum,
+        inspectionType: insp['Inspection Type'] || insp['Type'] || '',
+        requestDate: insp['Request Date'] || insp['Requested'] || '',
+        scheduledDate: insp['Scheduled Date'] || insp['Scheduled'] || '',
+        completedDate: insp['Completed Date'] || insp['Completed'] || insp['Date'] || '',
+        inspector: insp['Inspector'] || '',
+        result: insp['Result'] || insp['Status'] || '',
+        comments: insp['Comments'] || insp['Notes'] || '',
+      });
+    }
+
+    for (const doc of documents) {
+      insertDocument(db, {
+        applicationNumber: appNum,
+        documentName: doc['Document Name'] || doc['File Name'] || doc['Name'] || doc['Description'] || '',
+        documentType: doc['Document Type'] || doc['Type'] || doc['Category'] || '',
+        documentDate: doc['Date'] || doc['Upload Date'] || doc['Document Date'] || '',
+      });
+    }
   }
   return refs.length;
 }
@@ -619,10 +846,12 @@ async function main() {
       applications: db.prepare('SELECT COUNT(*) as n FROM applications').get().n,
       subPermits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
       fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
+      inspections: db.prepare('SELECT COUNT(*) as n FROM inspections').get().n,
+      documents: db.prepare('SELECT COUNT(*) as n FROM documents').get().n,
     };
 
     console.log(`\n==================================`);
-    console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees`);
+    console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections, ${counts.documents} documents`);
     console.log(`Database: ${path.resolve(opts.output)}`);
   } finally {
     await browser.close();

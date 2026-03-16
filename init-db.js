@@ -20,6 +20,8 @@ const db = new DatabaseSync(dbPath);
 if (reset) {
   console.log('Dropping existing tables...');
   db.exec(`
+    DROP TABLE IF EXISTS documents;
+    DROP TABLE IF EXISTS inspections;
     DROP TABLE IF EXISTS fees;
     DROP TABLE IF EXISTS sub_permits;
     DROP TABLE IF EXISTS applications;
@@ -66,6 +68,26 @@ db.exec(`
     owing REAL,
     date_paid TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS inspections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_number TEXT NOT NULL REFERENCES applications(reference_number),
+    inspection_type TEXT,
+    request_date TEXT,
+    scheduled_date TEXT,
+    completed_date TEXT,
+    inspector TEXT,
+    result TEXT,
+    comments TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_number TEXT NOT NULL REFERENCES applications(reference_number),
+    document_name TEXT,
+    document_type TEXT,
+    document_date TEXT
+  );
 `);
 
 const counts = {
@@ -73,9 +95,11 @@ const counts = {
   applications: db.prepare('SELECT COUNT(*) as n FROM applications').get().n,
   sub_permits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
   fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
+  inspections: db.prepare('SELECT COUNT(*) as n FROM inspections').get().n,
+  documents: db.prepare('SELECT COUNT(*) as n FROM documents').get().n,
 };
 
 console.log(`Database: ${path.resolve(dbPath)}`);
-console.log(`Tables: properties (${counts.properties}), applications (${counts.applications}), sub_permits (${counts.sub_permits}), fees (${counts.fees})`);
+console.log(`Tables: properties (${counts.properties}), applications (${counts.applications}), sub_permits (${counts.sub_permits}), fees (${counts.fees}), inspections (${counts.inspections}), documents (${counts.documents})`);
 
 db.close();
