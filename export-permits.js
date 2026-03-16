@@ -20,7 +20,7 @@
  *   CITYVIEW_EMAIL / CITYVIEW_PASSWORD - Login for authenticated access (permits)
  */
 
-const { chromium } = require('playwright-core');
+const { chromium } = require('playwright');
 const { DatabaseSync } = require('node:sqlite');
 const fs = require('fs');
 const path = require('path');
@@ -155,7 +155,6 @@ function parseArgs() {
 async function createBrowser() {
   const launchOptions = {
     headless: true,
-    executablePath: '/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome',
   };
   if (proxyUrl) {
     const parsed = new URL(proxyUrl);
