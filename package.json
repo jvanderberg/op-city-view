@@ -5,6 +5,8 @@
   "main": "export-permits.js",
   "scripts": {
     "export": "node export-permits.js",
+    "init-db": "node init-db.js",
+    "reset-db": "node init-db.js --reset",
     "test": "node export-permits.js --help"
   },
   "repository": {
