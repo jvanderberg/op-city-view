@@ -16,9 +16,75 @@ npm install
 node init-db.js            # Create empty database with schema
 ```
 
+## Parcel Driver CSV
+
+The scraper is driven by `parcels.csv`, a CSV file listing every Oak Park
+residential property to scrape. Columns:
+
+| Column | Description |
+|--------|-------------|
+| `parcel_number` | 14-digit Cook County PIN (e.g. `16184080040000`) |
+| `address` | Street address from Cook County address points |
+| `latitude` | Latitude coordinate (empty for ~354 unit-level PINs) |
+| `longitude` | Longitude coordinate |
+| `property_class` | Cook County Assessor class code (e.g. `205`, `206`) |
+| `historic_district` | Oak Park historic district name, or empty |
+| `scraped` | `true` if already scraped, `false` if pending |
+
+The `scraped` column makes the export restartable — re-running picks up where
+it left off.
+
+### Generating the CSV
+
+`generate-parcels.js` builds the CSV by querying the
+[tax_appeal_app](../tax_appeal_app) SQLite database (`data/properties.db`) and
+the Oak Park ArcGIS historic districts layer.
+
+```bash
+node generate-parcels.js                  # default paths
+node generate-parcels.js --db <path>      # custom DB path
+node generate-parcels.js --classes 205,206 # specific classes only
+node generate-parcels.js --year 2024      # assessment year
+```
+
+**Source query** (against `tax_appeal_app/data/properties.db`):
+
+```sql
+SELECT
+  av.pin,
+  av.class,
+  ap.address,
+  ap.lat,
+  ap.lon
+FROM assessed_values av
+LEFT JOIN address_points ap ON av.pin = ap.pin
+WHERE av.township_name = 'Oak Park'
+  AND av.year = 2024
+  AND av.class IN ('202','203','204','205','206','207','208','209','210','234','278','295')
+ORDER BY ap.address
+```
+
+This yields ~10,300 single-family residential properties. The class filter
+excludes condos (299), multi-family (211-212), and non-residential classes.
+
+**Historic district tagging**: The script fetches polygon boundaries from
+Oak Park's [ArcGIS Historic Districts layer](https://oak-park-open-data-portal-v2-oakparkil.hub.arcgis.com/datasets/d3ff666dfb764e8183879667acce810e_13/explore)
+and uses ray-casting point-in-polygon to classify each property into one of
+three districts:
+
+| District | Properties |
+|----------|-----------|
+| Frank Lloyd Wright | ~1,656 |
+| Ridgeland - Oak Park | ~1,126 |
+| Gunderson | ~267 |
+| _(none)_ | ~7,251 |
+
 ## Usage
 
 ```bash
+# CSV-driven bulk scrape (restartable, 10s between requests)
+node export-permits.js --parcels parcels.csv
+
 # Single address
 node export-permits.js --address "1010 S EUCLID AVE"
 
@@ -31,14 +97,15 @@ node export-permits.js --file addresses.txt
 # Custom output path (default: cityview.db)
 node export-permits.js --output oakpark.db
 
-# Adjust delay between requests (default: 1000ms)
+# Adjust delay between requests (default: 10000ms)
 node export-permits.js --delay 2000
 ```
 
 Or via npm scripts:
 
 ```bash
-npm run export -- --address "1010 S EUCLID AVE"
+npm run generate-parcels
+npm run export -- --parcels parcels.csv
 npm run init-db
 ```
 

@@ -103,16 +103,20 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
     addresses: [],
+    parcels: null, // path to parcels CSV from generate-parcels.js
     street: null,
     file: null,
     output: 'cityview.db',
-    delay: 1000,
+    delay: 10000,
   };
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case '--address': case '-a':
         opts.addresses.push(args[++i]);
+        break;
+      case '--parcels': case '-p':
+        opts.parcels = args[++i];
         break;
       case '--street': case '-s':
         opts.street = args[++i];
@@ -128,11 +132,12 @@ function parseArgs() {
         break;
       case '--help': case '-h':
         console.log(`Usage:
+  node export-permits.js --parcels parcels.csv          (CSV-driven, restartable)
   node export-permits.js --address "1010 S EUCLID AVE"
   node export-permits.js --street "GROVE AVE"
   node export-permits.js --file addresses.txt
   node export-permits.js --output oakpark.db
-  node export-permits.js --delay 2000`);
+  node export-permits.js --delay 10000`);
         process.exit(0);
     }
   }
@@ -649,18 +654,150 @@ async function fetchAndStoreLicenses(page, db, parcel) {
   return refs.length;
 }
 
+// ─── CSV driver ─────────────────────────────────────────────────────
+
+function parseCSV(content) {
+  const lines = content.split('\n').filter(l => l.trim());
+  if (lines.length < 2) return [];
+
+  const headers = lines[0].split(',').map(h => h.trim());
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const values = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (const ch of lines[i]) {
+      if (ch === '"') {
+        inQuotes = !inQuotes;
+      } else if (ch === ',' && !inQuotes) {
+        values.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    values.push(current);
+
+    const row = {};
+    headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function csvEscape(value) {
+  if (value == null) return '';
+  const s = String(value);
+  if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function writeCSV(filePath, headers, rows) {
+  const lines = [headers.join(',')];
+  for (const row of rows) {
+    lines.push(headers.map(h => csvEscape(row[h])).join(','));
+  }
+  fs.writeFileSync(filePath, lines.join('\n') + '\n');
+}
+
 // ─── Main ────────────────────────────────────────────────────────────
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function main() {
-  const opts = parseArgs();
+async function scrapeParcel(page, db, parcel, isAuthenticated) {
+  const ce = await fetchAndStoreComplaints(page, db, parcel);
+  if (ce > 0) console.log(`  -> ${ce} code enforcement`);
 
-  console.log('Oak Park CityView Permit Exporter');
-  console.log('==================================\n');
+  if (isAuthenticated) {
+    const permits = await fetchAndStorePermits(page, db, parcel);
+    if (permits > 0) console.log(`  -> ${permits} permits`);
+  }
 
+  const planning = await fetchAndStorePlanning(page, db, parcel);
+  if (planning > 0) console.log(`  -> ${planning} planning`);
+
+  const licenses = await fetchAndStoreLicenses(page, db, parcel);
+  if (licenses > 0) console.log(`  -> ${licenses} licenses`);
+}
+
+async function runParcelMode(opts) {
+  const csvContent = fs.readFileSync(opts.parcels, 'utf-8');
+  const allRows = parseCSV(csvContent);
+  const headers = ['parcel_number', 'address', 'latitude', 'longitude', 'property_class', 'historic_district', 'scraped'];
+
+  const pending = allRows.filter(r => r.scraped !== 'true');
+  const alreadyDone = allRows.length - pending.length;
+
+  console.log(`CSV: ${allRows.length} parcels total, ${alreadyDone} already scraped, ${pending.length} remaining\n`);
+
+  if (pending.length === 0) {
+    console.log('All parcels already scraped.');
+    return;
+  }
+
+  const db = initDatabase(opts.output);
+  console.log(`Database: ${path.resolve(opts.output)}\n`);
+
+  const { browser, context } = await createBrowser();
+
+  try {
+    let page = await initPage(context);
+    console.log('Connected to CityView portal.\n');
+
+    const isAuthenticated = await login(page);
+
+    let processed = 0;
+
+    for (const row of pending) {
+      processed++;
+      const parcel = row.parcel_number;
+      const address = row.address || parcel;
+      console.log(`[${alreadyDone + processed}/${allRows.length}] ${address} (${parcel})`);
+
+      try {
+        // Insert property with metadata from the CSV
+        insertProperty(db, parcel, address, {
+          latitude: row.latitude ? parseFloat(row.latitude) : null,
+          longitude: row.longitude ? parseFloat(row.longitude) : null,
+          propertyClass: row.property_class || null,
+          historicDistrictId: row.historic_district || null,
+        });
+
+        await scrapeParcel(page, db, parcel, isAuthenticated);
+
+        // Mark as scraped in the CSV
+        row.scraped = 'true';
+        writeCSV(opts.parcels, headers, allRows);
+      } catch (e) {
+        console.log(`  -> Error: ${e.message}`);
+        // Write CSV even on error so we don't lose progress
+        writeCSV(opts.parcels, headers, allRows);
+        try {
+          page = await initPage(context);
+          if (isAuthenticated) await login(page);
+        } catch {
+          page = await initPage(context);
+        }
+      }
+
+      if (processed < pending.length) await sleep(opts.delay);
+    }
+
+    printSummary(db, opts.output);
+  } finally {
+    await browser.close();
+    db.close();
+  }
+}
+
+async function runAddressMode(opts) {
   const db = initDatabase(opts.output);
   console.log(`Database: ${path.resolve(opts.output)}\n`);
 
@@ -710,7 +847,7 @@ async function main() {
     }
 
     if (addresses.length === 0) {
-      console.log('No addresses specified. Use --address, --street, or --file.');
+      console.log('No addresses specified. Use --address, --street, --file, or --parcels.');
       await browser.close();
       return;
     }
@@ -734,19 +871,7 @@ async function main() {
         insertProperty(db, parcel, address);
         console.log(`  -> Parcel: ${parcel}`);
 
-        const ce = await fetchAndStoreComplaints(page, db, parcel);
-        if (ce > 0) console.log(`  -> ${ce} code enforcement`);
-
-        if (isAuthenticated) {
-          const permits = await fetchAndStorePermits(page, db, parcel);
-          if (permits > 0) console.log(`  -> ${permits} permits`);
-        }
-
-        const planning = await fetchAndStorePlanning(page, db, parcel);
-        if (planning > 0) console.log(`  -> ${planning} planning`);
-
-        const licenses = await fetchAndStoreLicenses(page, db, parcel);
-        if (licenses > 0) console.log(`  -> ${licenses} licenses`);
+        await scrapeParcel(page, db, parcel, isAuthenticated);
       } catch (e) {
         console.log(`  -> Error: ${e.message}`);
         try {
@@ -760,21 +885,37 @@ async function main() {
       if (processed < addresses.length) await sleep(opts.delay);
     }
 
-    // Summary
-    const counts = {
-      properties: db.prepare('SELECT COUNT(*) as n FROM properties').get().n,
-      applications: db.prepare('SELECT COUNT(*) as n FROM applications').get().n,
-      subPermits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
-      fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
-      inspections: db.prepare('SELECT COUNT(*) as n FROM inspections').get().n,
-    };
-
-    console.log(`\n==================================`);
-    console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections`);
-    console.log(`Database: ${path.resolve(opts.output)}`);
+    printSummary(db, opts.output);
   } finally {
     await browser.close();
     db.close();
+  }
+}
+
+function printSummary(db, output) {
+  const counts = {
+    properties: db.prepare('SELECT COUNT(*) as n FROM properties').get().n,
+    applications: db.prepare('SELECT COUNT(*) as n FROM applications').get().n,
+    subPermits: db.prepare('SELECT COUNT(*) as n FROM sub_permits').get().n,
+    fees: db.prepare('SELECT COUNT(*) as n FROM fees').get().n,
+    inspections: db.prepare('SELECT COUNT(*) as n FROM inspections').get().n,
+  };
+
+  console.log(`\n==================================`);
+  console.log(`Done! ${counts.properties} properties, ${counts.applications} applications, ${counts.subPermits} sub-permits, ${counts.fees} fees, ${counts.inspections} inspections`);
+  console.log(`Database: ${path.resolve(output)}`);
+}
+
+async function main() {
+  const opts = parseArgs();
+
+  console.log('Oak Park CityView Permit Exporter');
+  console.log('==================================\n');
+
+  if (opts.parcels) {
+    await runParcelMode(opts);
+  } else {
+    await runAddressMode(opts);
   }
 }
 

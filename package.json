@@ -4,6 +4,7 @@
   "description": "Oak Park CityView Portal - Residential Permit Data Exporter",
   "main": "export-permits.js",
   "scripts": {
+    "generate-parcels": "node generate-parcels.js",
     "export": "node export-permits.js",
     "init-db": "node init-db.js",
     "reset-db": "node init-db.js --reset",
