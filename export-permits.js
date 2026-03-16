@@ -2,16 +2,22 @@
 /**
  * Oak Park CityView Portal - Residential Permit Data Exporter
  *
- * Uses Playwright to interact with the CityView portal's internal APIs
- * to search for properties by address and export permit/complaint/license data.
+ * Uses Playwright to call CityView portal's internal APIs to discover records,
+ * then fetches full detail from each record's StatusReference page.
+ *
+ * Data flow:
+ *   1. Property LocationSearch API -> address autocomplete (JSON)
+ *   2. Property LocateResults API -> parcel number from redirect URL (JSON)
+ *   3. Module LocatorResults APIs -> list of reference numbers (JSON + View)
+ *   4. StatusReference detail pages -> full record data (displayField extraction)
  *
  * Usage:
  *   node export-permits.js --address "834 N AUSTIN BLVD"
  *   node export-permits.js --street "GROVE AVE"
  *   node export-permits.js --file addresses.txt
- *   node export-permits.js --range "100-200 N AUSTIN BLVD"
  *
- * Output: CSV file with all permit, complaint, license, and planning records.
+ * Environment:
+ *   CITYVIEW_EMAIL / CITYVIEW_PASSWORD - Login for authenticated access (permits)
  */
 
 const { chromium } = require('playwright-core');
@@ -24,7 +30,6 @@ const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY;
 const cityviewEmail = process.env.CITYVIEW_EMAIL;
 const cityviewPassword = process.env.CITYVIEW_PASSWORD;
 
-// Parse command-line arguments
 function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
@@ -32,7 +37,7 @@ function parseArgs() {
     street: null,
     file: null,
     output: 'permits-export.csv',
-    delay: 1000, // ms between requests
+    delay: 1000,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -55,10 +60,10 @@ function parseArgs() {
       case '--help': case '-h':
         console.log(`Usage:
   node export-permits.js --address "834 N AUSTIN BLVD"
-  node export-permits.js --street "GROVE AVE"           # Search all addresses on a street
-  node export-permits.js --file addresses.txt           # One address per line
-  node export-permits.js --output results.csv           # Output file (default: permits-export.csv)
-  node export-permits.js --delay 2000                   # Delay between requests in ms`);
+  node export-permits.js --street "GROVE AVE"
+  node export-permits.js --file addresses.txt
+  node export-permits.js --output results.csv
+  node export-permits.js --delay 2000`);
         process.exit(0);
     }
   }
@@ -96,7 +101,6 @@ async function initPage(context) {
   return page;
 }
 
-// Login to CityView portal for authenticated access (permits, etc.)
 async function login(page) {
   if (!cityviewEmail || !cityviewPassword) {
     console.log('No credentials provided. Running unauthenticated (permits may be unavailable).');
@@ -109,42 +113,43 @@ async function login(page) {
   await page.fill('#emailAddress', cityviewEmail);
   await page.fill('#password', cityviewPassword);
 
-  // Click login and wait for either navigation or response
   await Promise.all([
     page.waitForURL((url) => !url.href.includes('/Account/Logon'), { timeout: 30000 }).catch(() => {}),
     page.click('#bnext'),
   ]);
-
-  // Give the page time to settle
   await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-  // Check if login succeeded by looking for a logout link or user element
   const loggedIn = await page.evaluate(() => {
     const body = document.body.innerText;
     return body.includes('Log Off') || body.includes('Logoff') || !!document.querySelector('a[href*="Logoff"], a[href*="LogOff"]');
   });
 
-  if (loggedIn) {
-    console.log('Login successful.\n');
-  } else {
-    console.log('Login may have failed. Continuing anyway.\n');
-  }
+  console.log(loggedIn ? 'Login successful.\n' : 'Login may have failed. Continuing anyway.\n');
   return loggedIn;
 }
 
-// Search permits using the Permit Locator API (requires authentication)
-async function searchPermits(page, address) {
-  // Navigate to Permit Locator to establish context
-  await page.goto(`${BASE_URL}${PORTAL}/Permit/Locator`, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+// ─── API helpers ──────────────────────────────────────────────────────
 
-  // Use the Permit autocomplete API to search
-  const searchResults = await page.evaluate((term) => {
+// Extract indexed field values from LocatorResults View HTML via regex
+function parseViewRefNumbers(viewHtml, idPrefix) {
+  const refs = [];
+  const re = new RegExp(`id="${idPrefix}(\\d+)" class="inputText"[^>]*>([^<]*)`, 'g');
+  let m;
+  while ((m = re.exec(viewHtml)) !== null) {
+    const val = m[2].trim();
+    if (val) refs.push(val);
+  }
+  return [...new Set(refs)]; // deduplicate
+}
+
+// Generic module search -> LocatorResults API
+async function callModuleLocator(page, modulePath, searchEndpoint, locatorEndpoint, address) {
+  const searchResults = await page.evaluate(({ modulePath, searchEndpoint, term }) => {
     return new Promise((resolve) => {
       const token = jQuery('input[name="__RequestVerificationToken"]').val();
       jQuery.ajax({
         type: 'POST',
-        url: '/CityViewPortal/Permit/PermitSearch',
+        url: `/CityViewPortal/${modulePath}/${searchEndpoint}`,
         dataType: 'json',
         headers: { __RequestVerificationToken: token },
         data: {
@@ -162,116 +167,64 @@ async function searchPermits(page, address) {
           if (typeof results === 'string') results = JSON.parse(results);
           resolve(results);
         },
-        error: (xhr) => resolve([]),
+        error: () => resolve([]),
       });
     });
-  }, address);
+  }, { modulePath, searchEndpoint, term: address });
 
-  if (!searchResults || searchResults.length === 0) return [];
+  if (!Array.isArray(searchResults) || searchResults.length === 0) return null;
+  const validResults = searchResults.filter(r => !r.includes('no matches'));
+  if (validResults.length === 0) return null;
 
-  // Pick the best match (exact or first)
   const upperAddr = address.toUpperCase();
-  const match = searchResults.find(r => r.toUpperCase().includes(upperAddr)) || searchResults[0];
+  const match = validResults.find(r => r.toUpperCase().includes(upperAddr)) || validResults[0];
 
-  // Get locator results for this address
-  const locateResult = await page.evaluate((addr) => {
+  return page.evaluate(({ modulePath, locatorEndpoint, searchValue }) => {
     return new Promise((resolve) => {
       jQuery.ajax({
         type: 'GET',
-        url: '/CityViewPortal/Permit/LocatorResults',
-        data: { searchValue: addr },
+        url: `/CityViewPortal/${modulePath}/${locatorEndpoint}`,
+        data: { searchValue },
         success: (data) => resolve(data),
         error: () => resolve(null),
       });
     });
-  }, match);
-
-  if (!locateResult) return [];
-
-  // If we get a redirect URL, navigate to it and extract the permit list
-  if (locateResult.RedirectUrl) {
-    await page.goto(`${BASE_URL}${locateResult.RedirectUrl}`, { waitUntil: 'networkidle', timeout: 30000 });
-    return extractPermitTableFromPage(page);
-  }
-
-  // If HTML content is returned directly, parse it
-  if (typeof locateResult === 'string' || locateResult.Html) {
-    const html = locateResult.Html || locateResult;
-    return parsePermitLocatorHtml(page, html);
-  }
-
-  return [];
+  }, { modulePath, locatorEndpoint, searchValue: match });
 }
 
-// Extract permits from the Permit Locator results page
-async function extractPermitTableFromPage(page) {
+async function navigateToLocator(page, modulePath) {
+  await page.goto(`${BASE_URL}${PORTAL}/${modulePath}/Locator`, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+}
+
+// Extract all displayField label:value pairs from the current page
+async function extractDisplayFields(page) {
   return page.evaluate(() => {
-    const permits = [];
-    const tables = document.querySelectorAll('table');
-
-    for (const table of tables) {
-      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
-      if (!headers.some(h => h.includes('Application') || h.includes('Permit'))) continue;
-
-      let lastPermit = null;
-      Array.from(table.rows).slice(1).forEach(row => {
-        const cells = Array.from(row.cells).map(c => c.textContent.trim());
-        const fullText = cells.join(' ');
-
-        // Description/sub-rows (like "Permits: Building, Electric")
-        if (cells.length < headers.length || fullText.includes('Permits:') || fullText.includes('Description:')) {
-          if (lastPermit) {
-            const descText = fullText.replace(/^[\s]*(Permits|Description):[\s]*/i, '').replace(/\s+/g, ' ').trim();
-            lastPermit.Description = lastPermit.Description ? `${lastPermit.Description}; ${descText}` : descText;
-          }
-          return;
-        }
-
-        const rowData = {};
-        headers.forEach((h, i) => { rowData[h] = cells[i] || ''; });
-        lastPermit = rowData;
-        permits.push(rowData);
-      });
-    }
-    return permits;
+    const fields = {};
+    document.querySelectorAll('.displayField').forEach(f => {
+      const label = f.querySelector('label');
+      const value = f.querySelector('.inputText, .fieldData');
+      if (label && value) {
+        const l = label.textContent.trim().replace(/:$/, '');
+        const v = value.textContent.trim();
+        if (l && v) fields[l] = v;
+      }
+    });
+    return fields;
   });
 }
 
-// Parse permit locator HTML response
-async function parsePermitLocatorHtml(page, html) {
-  return page.evaluate((htmlStr) => {
-    const div = document.createElement('div');
-    div.innerHTML = htmlStr;
-    const permits = [];
-    const links = div.querySelectorAll('a[href*="Permit"]');
-    const rows = div.querySelectorAll('tr, .result-row');
-
-    // Try to find a table structure
-    const tables = div.querySelectorAll('table');
-    for (const table of tables) {
-      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
-      let lastPermit = null;
-      Array.from(table.rows).slice(1).forEach(row => {
-        const cells = Array.from(row.cells).map(c => c.textContent.trim());
-        const fullText = cells.join(' ');
-        if (cells.length < headers.length || fullText.includes('Permits:') || fullText.includes('Description:')) {
-          if (lastPermit) {
-            const descText = fullText.replace(/^[\s]*(Permits|Description):[\s]*/i, '').replace(/\s+/g, ' ').trim();
-            lastPermit.Description = lastPermit.Description ? `${lastPermit.Description}; ${descText}` : descText;
-          }
-          return;
-        }
-        const rowData = {};
-        headers.forEach((h, i) => { rowData[h] = cells[i] || ''; });
-        lastPermit = rowData;
-        permits.push(rowData);
-      });
-    }
-    return permits;
-  }, html);
+// Fetch full detail from a StatusReference page
+async function fetchStatusDetail(page, modulePath, referenceNumber) {
+  await page.goto(`${BASE_URL}${PORTAL}/${modulePath}/StatusReference?referenceNumber=${encodeURIComponent(referenceNumber)}`, {
+    waitUntil: 'networkidle',
+    timeout: 30000,
+  });
+  return extractDisplayFields(page);
 }
 
-// Search for addresses matching a term
+// ─── Address search ──────────────────────────────────────────────────
+
 async function searchAddresses(page, term) {
   return page.evaluate((t) => {
     return new Promise((resolve) => {
@@ -296,249 +249,151 @@ async function searchAddresses(page, term) {
           if (typeof results === 'string') results = JSON.parse(results);
           resolve(results);
         },
-        error: (xhr) => resolve([]),
+        error: () => resolve([]),
       });
     });
   }, term);
 }
 
-// Get the property review URL for a specific address
-async function getPropertyUrl(page, address) {
-  return page.evaluate((addr) => {
+async function getParcelNumber(page, address) {
+  const result = await page.evaluate((addr) => {
     return new Promise((resolve) => {
       jQuery.ajax({
         type: 'GET',
         url: '/CityViewPortal/Property/LocateResults',
         data: { locationDesc: addr },
-        success: (data) => resolve(data.RedirectUrl || null),
+        success: (data) => resolve(data),
         error: () => resolve(null),
       });
     });
   }, address);
+
+  if (!result || !result.RedirectUrl) return null;
+  const match = result.RedirectUrl.match(/searchValue=PRO(\d+)/);
+  return match ? match[1] : null;
 }
 
-// Extract all data from a property review page
-async function extractPropertyData(page, url) {
-  await page.goto(`${BASE_URL}${url}`, { waitUntil: 'networkidle', timeout: 30000 });
+// ─── Module fetchers ─────────────────────────────────────────────────
 
-  return page.evaluate(() => {
-    const result = {
-      parcelNumber: '',
-      status: '',
-      legalDescription: '',
-      addresses: [],
-      zones: [],
-      complaints: [],
-      licenses: [],
-      permits: [],
-      engineeringPermits: [],
-      planningApps: [],
-    };
+// Get all unique reference numbers for a module by searching both address and parcel
+async function getModuleRefs(page, modulePath, searchEndpoint, idPrefix, address, parcel) {
+  await navigateToLocator(page, modulePath);
 
-    // Property details
-    const detailFields = document.querySelectorAll('.displayField');
-    detailFields.forEach(f => {
-      const label = f.querySelector('.cv-label, label');
-      const value = f.querySelector('.cv-value, .fieldData, span:last-child');
-      if (label && value) {
-        const l = label.textContent.trim().replace(':', '');
-        const v = value.textContent.trim();
-        if (l.includes('Parcel')) result.parcelNumber = v;
-        if (l.includes('Status')) result.status = v;
-        if (l.includes('Legal')) result.legalDescription = v;
-      }
-    });
+  const allRefs = new Set();
 
-    // Fallback: get parcel from page text
-    if (!result.parcelNumber) {
-      const match = document.body.innerText.match(/Parcel Number:\s*(\d+)/);
-      if (match) result.parcelNumber = match[1];
-    }
-
-    // Addresses table
-    const addrTable = document.getElementById('propertyAddresses');
-    if (addrTable) {
-      Array.from(addrTable.rows).slice(1).forEach(row => {
-        const cells = Array.from(row.cells).map(c => c.textContent.trim());
-        if (cells.length >= 4) {
-          result.addresses.push({
-            streetNumber: cells[0],
-            preDirection: cells[1],
-            streetName: cells[2],
-            direction: cells[3],
-            unit: cells[4] || '',
-            status: cells[5] || '',
-          });
-        }
-      });
-    }
-
-    // Parse all tables generically by section
-    const fieldsets = document.querySelectorAll('fieldset, .accordion');
-    fieldsets.forEach(fs => {
-      const legend = fs.querySelector('legend, h3, h4');
-      if (!legend) return;
-      const sectionName = legend.textContent.trim();
-      const table = fs.querySelector('table');
-
-      if (!table) return;
-
-      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
-      const rows = [];
-
-      Array.from(table.rows).slice(1).forEach(row => {
-        const cells = Array.from(row.cells).map(c => c.textContent.trim());
-        if (cells.length > 0) {
-          // Description rows have fewer cells (usually merged/colspan) and contain "Description:"
-          const fullText = cells.join(' ');
-          if (cells.length < headers.length || fullText.includes('Description:')) {
-            if (rows.length > 0) {
-              rows[rows.length - 1].Description = fullText.replace(/^[\s]*Description:[\s]*/i, '').replace(/\s+/g, ' ').trim();
-            }
-          } else {
-            const rowData = {};
-            headers.forEach((h, i) => { rowData[h] = cells[i] || ''; });
-            rows.push(rowData);
-          }
-        }
-      });
-
-      if (sectionName.includes('Code Enforcement') || sectionName.includes('Complaint')) {
-        result.complaints.push(...rows);
-      } else if (sectionName.includes('License')) {
-        result.licenses.push(...rows);
-      } else if (sectionName.includes('Engineering')) {
-        result.engineeringPermits.push(...rows);
-      } else if (sectionName.includes('Permit')) {
-        result.permits.push(...rows);
-      } else if (sectionName.includes('Planning')) {
-        result.planningApps.push(...rows);
-      }
-    });
-
-    // Also try generic approach - grab all tables with known headers
-    document.querySelectorAll('table').forEach(table => {
-      const id = table.id;
-      if (id === 'propertyAddresses' || id === 'propertyContacts') return;
-
-      const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
-      if (headers.includes('Permit Number') || headers.includes('Application Number')) {
-        Array.from(table.rows).slice(1).forEach(row => {
-          const cells = Array.from(row.cells).map(c => c.textContent.trim());
-          if (cells.length >= headers.length) {
-            const rowData = {};
-            headers.forEach((h, i) => { rowData[h] = cells[i] || ''; });
-            // Add to permits if not already captured
-            const existing = [...result.permits, ...result.engineeringPermits, ...result.planningApps];
-            const isDuplicate = existing.some(r =>
-              (r['Permit Number'] === rowData['Permit Number'] && rowData['Permit Number']) ||
-              (r['Application Number'] === rowData['Application Number'] && rowData['Application Number'])
-            );
-            if (!isDuplicate) result.permits.push(rowData);
-          }
-        });
-      }
-    });
-
-    return result;
-  });
-}
-
-// Flatten property data into CSV rows
-function flattenToCSVRows(address, data) {
-  const rows = [];
-  const baseFields = {
-    Address: address,
-    ParcelNumber: data.parcelNumber,
-    PropertyStatus: data.status,
-  };
-
-  // Add complaint records
-  data.complaints.forEach(c => {
-    rows.push({
-      ...baseFields,
-      RecordType: 'Code Enforcement',
-      ReferenceNumber: c['Case Number'] || '',
-      Type: c['Type'] || '',
-      Status: c['Status'] || '',
-      Date: c['Date Entered'] || '',
-      Description: (c['Description'] || '').replace(/[\n\r]+/g, ' ').trim(),
-    });
-  });
-
-  // Add permit records
-  data.permits.forEach(p => {
-    const type = p['Type'] || p['Permit Type'] || '';
-    const workClass = p['Work Class'] || '';
-    const fullType = workClass ? `${type} - ${workClass}` : type;
-    let desc = (p['Description'] || p['Work Description'] || '').replace(/[\n\r]+/g, ' ').trim();
-    // Clean up "Permits: X, Y Description: actual text" pattern
-    desc = desc.replace(/^Permits:\s*[^]*?\s*Description:\s*/i, '').trim();
-    rows.push({
-      ...baseFields,
-      RecordType: 'Permit',
-      ReferenceNumber: p['Permit Number'] || p['Application Number'] || '',
-      Type: fullType,
-      Status: p['Status'] || '',
-      Date: p['Date Issued'] || p['Date Entered'] || p['Date'] || p['Application Date'] || '',
-      Description: desc,
-    });
-  });
-
-  // Add engineering permits
-  data.engineeringPermits.forEach(p => {
-    rows.push({
-      ...baseFields,
-      RecordType: 'Engineering Permit',
-      ReferenceNumber: p['Permit Number'] || p['Application Number'] || '',
-      Type: p['Type'] || '',
-      Status: p['Status'] || '',
-      Date: p['Date Entered'] || p['Date'] || '',
-      Description: (p['Description'] || '').replace(/[\n\r]+/g, ' ').trim(),
-    });
-  });
-
-  // Add license records
-  data.licenses.forEach(l => {
-    rows.push({
-      ...baseFields,
-      RecordType: 'License',
-      ReferenceNumber: l['License Number'] || l['Application Number'] || '',
-      Type: l['Type'] || '',
-      Status: l['Status'] || '',
-      Date: l['Date Entered'] || l['Date'] || '',
-      Description: (l['Description'] || '').replace(/[\n\r]+/g, ' ').trim(),
-    });
-  });
-
-  // Add planning records
-  data.planningApps.forEach(p => {
-    rows.push({
-      ...baseFields,
-      RecordType: 'Planning',
-      ReferenceNumber: p['Application Number'] || '',
-      Type: p['Type'] || '',
-      Status: p['Status'] || '',
-      Date: p['Date Entered'] || p['Date'] || '',
-      Description: (p['Description'] || '').replace(/[\n\r]+/g, ' ').trim(),
-    });
-  });
-
-  // If no records, add a row indicating empty
-  if (rows.length === 0) {
-    rows.push({
-      ...baseFields,
-      RecordType: 'None',
-      ReferenceNumber: '',
-      Type: '',
-      Status: '',
-      Date: '',
-      Description: 'No records found',
-    });
+  // Search by address
+  const addrResult = await callModuleLocator(page, modulePath, searchEndpoint, 'LocatorResults', address);
+  if (addrResult && addrResult.View) {
+    for (const ref of parseViewRefNumbers(addrResult.View, idPrefix)) allRefs.add(ref);
   }
 
-  return rows;
+  // Search by parcel number for more complete results
+  if (parcel) {
+    const parcelResult = await page.evaluate(({ modulePath, searchValue }) => {
+      return new Promise((resolve) => {
+        jQuery.ajax({
+          type: 'GET',
+          url: `/CityViewPortal/${modulePath}/LocatorResults`,
+          data: { searchValue },
+          success: (data) => resolve(data),
+          error: () => resolve(null),
+        });
+      });
+    }, { modulePath, searchValue: parcel });
+
+    if (parcelResult && parcelResult.View) {
+      for (const ref of parseViewRefNumbers(parcelResult.View, idPrefix)) allRefs.add(ref);
+    }
+  }
+
+  return [...allRefs];
 }
+
+async function fetchComplaints(page, address, parcel) {
+  const refs = await getModuleRefs(page, 'CodeEnforcement', 'ComplaintSearch', 'caseNumber', address, parcel);
+  const records = [];
+  for (const ref of refs) {
+    const fields = await fetchStatusDetail(page, 'CodeEnforcement', ref);
+    records.push({
+      RecordType: 'Code Enforcement',
+      ReferenceNumber: fields['Case Number'] || ref,
+      Type: fields['Complaint Type'] || '',
+      Status: fields['Status'] || '',
+      Date: fields['Date Entered'] || '',
+      Description: fields['Description'] || '',
+    });
+  }
+  return records;
+}
+
+async function fetchPermits(page, address, parcel) {
+  const refs = await getModuleRefs(page, 'Permit', 'PermitSearch', 'permitNumber', address, parcel);
+  const records = [];
+  for (const ref of refs) {
+    const fields = await fetchStatusDetail(page, 'Permit', ref);
+    records.push({
+      RecordType: 'Permit',
+      ReferenceNumber: fields['Application Number'] || ref,
+      Type: fields['Application Type'] || '',
+      WorkClass: fields['Category of Work'] || '',
+      Status: fields['Application Status'] || '',
+      DateIssued: fields['Issued Date'] || fields['Date Issued'] || '',
+      ApplicationDate: fields['Application Date'] || '',
+      ExpirationDate: fields['Expiration Date'] || '',
+      DateFinaled: fields['Date Finaled'] || '',
+      PermitType: fields['Permit Type'] || '',
+      PermitStatus: fields['Permit Status'] || '',
+      Description: fields['Description of Work'] || '',
+    });
+  }
+  return records;
+}
+
+async function fetchPlanning(page, address, parcel) {
+  const refs = await getModuleRefs(page, 'Planning', 'ApplicationSearch', 'applicationNumber', address, parcel);
+  const records = [];
+  for (const ref of refs) {
+    const fields = await fetchStatusDetail(page, 'Planning', ref);
+    records.push({
+      RecordType: 'Planning',
+      ReferenceNumber: fields['Application Number'] || ref,
+      Type: fields['Application Type'] || fields['Type'] || '',
+      Status: fields['Status'] || fields['Application Status'] || '',
+      Date: fields['Date Entered'] || fields['Application Date'] || '',
+      Description: fields['Description'] || '',
+    });
+  }
+  return records;
+}
+
+async function fetchLicenses(page, address, parcel) {
+  await navigateToLocator(page, 'License');
+  const result = await callModuleLocator(page, 'License', 'LocationSearch', 'LocatorResults', address);
+  if (!result || !result.View) return [];
+
+  const refs = parseViewRefNumbers(result.View, 'licenseNumber');
+  const records = [];
+  for (const ref of refs) {
+    const fields = await fetchStatusDetail(page, 'License', ref);
+    records.push({
+      RecordType: 'License',
+      ReferenceNumber: fields['License Number'] || ref,
+      Type: fields['License Type'] || fields['Type'] || '',
+      Status: fields['Status'] || '',
+      Date: fields['Date Entered'] || fields['Issue Date'] || '',
+      Description: fields['Description'] || '',
+    });
+  }
+  return records;
+}
+
+// ─── CSV output ──────────────────────────────────────────────────────
+
+const CSV_HEADERS = [
+  'Address', 'ParcelNumber', 'RecordType', 'ReferenceNumber', 'Type',
+  'WorkClass', 'Status', 'ApplicationDate', 'DateIssued', 'ExpirationDate',
+  'DateFinaled', 'PermitType', 'PermitStatus', 'Date', 'Description',
+];
 
 function escapeCSV(val) {
   if (val == null) return '';
@@ -550,19 +405,19 @@ function escapeCSV(val) {
 }
 
 function writeCSVHeader(filePath) {
-  const headers = ['Address', 'ParcelNumber', 'PropertyStatus', 'RecordType', 'ReferenceNumber', 'Type', 'Status', 'Date', 'Description'];
-  fs.writeFileSync(filePath, headers.join(',') + '\n');
+  fs.writeFileSync(filePath, CSV_HEADERS.join(',') + '\n');
 }
 
 function appendCSVRows(filePath, rows) {
-  const headers = ['Address', 'ParcelNumber', 'PropertyStatus', 'RecordType', 'ReferenceNumber', 'Type', 'Status', 'Date', 'Description'];
-  const lines = rows.map(row => headers.map(h => escapeCSV(row[h])).join(','));
+  const lines = rows.map(row => CSV_HEADERS.map(h => escapeCSV(row[h])).join(','));
   fs.appendFileSync(filePath, lines.join('\n') + '\n');
 }
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+// ─── Main ────────────────────────────────────────────────────────────
 
 async function main() {
   const opts = parseArgs();
@@ -576,22 +431,17 @@ async function main() {
     let page = await initPage(context);
     console.log('Connected to CityView portal.\n');
 
-    // Login if credentials are available
     const isAuthenticated = await login(page);
 
-    // Navigate back to Property search after login
+    // Navigate to Property search
     await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
 
     let addresses = [...opts.addresses];
 
-    // If street search, find all addresses on that street using multiple prefix queries
-    // The autocomplete returns max ~12 results per query, so we search with different
-    // number prefixes to get comprehensive coverage.
     if (opts.street) {
       console.log(`Searching for all addresses on "${opts.street}"...`);
       const seen = new Set();
-      // Search with each leading digit (1-9) and double-digit prefixes
       const prefixes = ['1', '2', '3', '4', '5', '6', '7', '8', '9'];
       for (let d = 10; d <= 19; d++) prefixes.push(String(d));
 
@@ -606,12 +456,9 @@ async function main() {
             newCount++;
           }
         }
-        if (newCount > 0) {
-          console.log(`  "${term}" -> ${results.length} results (${newCount} new)`);
-        }
+        if (newCount > 0) console.log(`  "${term}" -> ${results.length} results (${newCount} new)`);
         await sleep(300);
 
-        // If this prefix returned 12 results, search deeper with sub-prefixes
         if (results.length >= 12) {
           for (let sub = 0; sub <= 9; sub++) {
             const subTerm = `${prefix}${sub} ${opts.street}`;
@@ -624,9 +471,7 @@ async function main() {
                 subNew++;
               }
             }
-            if (subNew > 0) {
-              console.log(`  "${subTerm}" -> ${subResults.length} results (${subNew} new)`);
-            }
+            if (subNew > 0) console.log(`  "${subTerm}" -> ${subResults.length} results (${subNew} new)`);
             await sleep(300);
           }
         }
@@ -634,16 +479,12 @@ async function main() {
       console.log(`Total unique addresses found: ${addresses.length}`);
     }
 
-    // If no addresses specified, show help
     if (addresses.length === 0) {
-      console.log('No addresses specified. Use --address, --street, or --file.\n');
-      console.log('Example: node export-permits.js --street "GROVE AVE"');
-      console.log('         node export-permits.js --address "834 N AUSTIN BLVD OAK PARK IL 60302"');
+      console.log('No addresses specified. Use --address, --street, or --file.');
       await browser.close();
       return;
     }
 
-    // Initialize CSV
     writeCSVHeader(opts.output);
     console.log(`Writing results to: ${opts.output}\n`);
 
@@ -655,75 +496,62 @@ async function main() {
       console.log(`[${processed}/${addresses.length}] Processing: ${address}`);
 
       try {
-        // Get property review URL
-        const reviewUrl = await getPropertyUrl(page, address);
-        if (!reviewUrl) {
-          console.log('  -> No property found, skipping');
-          appendCSVRows(opts.output, [{ Address: address, ParcelNumber: '', PropertyStatus: '', RecordType: 'Not Found', ReferenceNumber: '', Type: '', Status: '', Date: '', Description: 'Property not found' }]);
+        // Get parcel number via Property API
+        await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
+        await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+        const parcel = await getParcelNumber(page, address);
+
+        if (!parcel) {
+          console.log('  -> No property found');
+          appendCSVRows(opts.output, [{ Address: address, RecordType: 'Not Found' }]);
           continue;
         }
 
-        // Extract property data from PropertyReview page
-        const data = await extractPropertyData(page, reviewUrl);
+        console.log(`  -> Parcel: ${parcel}`);
+        const baseFields = { Address: address, ParcelNumber: parcel };
+        const rows = [];
 
-        // If authenticated, also fetch permits via the Permit Locator API for richer data
+        // Code Enforcement via API + StatusReference detail
+        const complaints = await fetchComplaints(page, address, parcel);
+        console.log(`  -> ${complaints.length} code enforcement records`);
+        for (const c of complaints) rows.push({ ...baseFields, ...c });
+
+        // Permits via API + StatusReference detail (requires auth)
         if (isAuthenticated) {
-          try {
-            const permitData = await searchPermits(page, address);
-            if (permitData.length > 0) {
-              // Merge: use Permit Locator data as primary, add any unique records from PropertyReview
-              const locatorRefs = new Set(permitData.map(p => p['Permit Number'] || p['Application Number']));
-              const uniqueFromProperty = data.permits.filter(p => {
-                const ref = p['Permit Number'] || p['Application Number'] || '';
-                return ref && !locatorRefs.has(ref);
-              });
-              data.permits = [...permitData, ...uniqueFromProperty];
-              console.log(`  -> Permit Locator: ${permitData.length} permit records found`);
-            }
-          } catch (e) {
-            console.log(`  -> Permit Locator error: ${e.message}`);
-          }
+          const permits = await fetchPermits(page, address, parcel);
+          console.log(`  -> ${permits.length} permit records`);
+          for (const p of permits) rows.push({ ...baseFields, ...p });
         }
 
-        // Deduplicate permits by reference number
-        const seenPermitRefs = new Set();
-        data.permits = data.permits.filter(p => {
-          const ref = p['Permit Number'] || p['Application Number'] || '';
-          if (!ref || seenPermitRefs.has(ref)) return false;
-          seenPermitRefs.add(ref);
-          return true;
-        });
+        // Planning via API + StatusReference detail
+        const planning = await fetchPlanning(page, address, parcel);
+        if (planning.length > 0) console.log(`  -> ${planning.length} planning records`);
+        for (const p of planning) rows.push({ ...baseFields, ...p });
 
-        const totalForProperty = data.complaints.length + data.permits.length + data.engineeringPermits.length + data.licenses.length + data.planningApps.length;
-        console.log(`  -> Parcel: ${data.parcelNumber} | ${totalForProperty} records (${data.complaints.length} complaints, ${data.permits.length} permits, ${data.engineeringPermits.length} eng permits, ${data.licenses.length} licenses, ${data.planningApps.length} planning)`);
+        // Licenses via API + StatusReference detail
+        const licenses = await fetchLicenses(page, address, parcel);
+        if (licenses.length > 0) console.log(`  -> ${licenses.length} license records`);
+        for (const l of licenses) rows.push({ ...baseFields, ...l });
 
-        // Flatten and write
-        const rows = flattenToCSVRows(address, data);
+        if (rows.length === 0) {
+          rows.push({ ...baseFields, RecordType: 'None' });
+        }
+
         appendCSVRows(opts.output, rows);
         totalRecords += rows.length;
-
-        // Navigate back to search page for next search
-        await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
-        await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
       } catch (e) {
         console.log(`  -> Error: ${e.message}`);
-        appendCSVRows(opts.output, [{ Address: address, ParcelNumber: '', PropertyStatus: '', RecordType: 'Error', ReferenceNumber: '', Type: '', Status: '', Date: '', Description: e.message }]);
+        appendCSVRows(opts.output, [{ Address: address, RecordType: 'Error', Description: e.message }]);
 
-        // Reinitialize page on error
         try {
-          await page.goto(`${BASE_URL}${PORTAL}/Property`, { waitUntil: 'networkidle', timeout: 30000 });
-          await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+          page = await initPage(context);
+          if (isAuthenticated) await login(page);
         } catch {
-          // If page is completely broken, create a new one
-          const newPage = await initPage(context);
-          page = newPage;
+          page = await initPage(context);
         }
       }
 
-      // Rate limiting
-      if (processed < addresses.length) {
-        await sleep(opts.delay);
-      }
+      if (processed < addresses.length) await sleep(opts.delay);
     }
 
     console.log(`\n==================================`);
