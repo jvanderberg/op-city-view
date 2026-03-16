@@ -39,7 +39,11 @@ function initDatabase(dbPath) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS properties (
       parcel_number TEXT PRIMARY KEY,
-      address TEXT NOT NULL
+      address TEXT NOT NULL,
+      latitude REAL,
+      longitude REAL,
+      property_class TEXT,
+      historic_district_id TEXT
     );
 
     CREATE TABLE IF NOT EXISTS applications (
@@ -382,9 +386,12 @@ function nullIfEmpty(s) {
   return s || null;
 }
 
-function insertProperty(db, parcel, address) {
-  db.prepare(`INSERT OR IGNORE INTO properties (parcel_number, address) VALUES (?, ?)`)
-    .run(parcel, address);
+function insertProperty(db, parcel, address, opts = {}) {
+  db.prepare(`INSERT OR REPLACE INTO properties
+    (parcel_number, address, latitude, longitude, property_class, historic_district_id)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(parcel, address, opts.latitude || null, opts.longitude || null,
+      opts.propertyClass || null, opts.historicDistrictId || null);
 }
 
 function insertApplication(db, app) {

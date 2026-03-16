@@ -31,7 +31,11 @@ if (reset) {
 db.exec(`
   CREATE TABLE IF NOT EXISTS properties (
     parcel_number TEXT PRIMARY KEY,
-    address TEXT NOT NULL
+    address TEXT NOT NULL,
+    latitude REAL,
+    longitude REAL,
+    property_class TEXT,
+    historic_district_id TEXT
   );
 
   CREATE TABLE IF NOT EXISTS applications (

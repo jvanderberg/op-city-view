@@ -74,6 +74,10 @@ its Cook County parcel number.
 |--------|------|-------------|
 | `parcel_number` | TEXT PK | Cook County parcel ID (e.g. `16184080040000`) |
 | `address` | TEXT | Street address used to look up the property |
+| `latitude` | REAL | Latitude coordinate |
+| `longitude` | REAL | Longitude coordinate |
+| `property_class` | TEXT | Property classification (e.g. `Single-family`, `Multi-family`) |
+| `historic_district_id` | TEXT | Historic district identifier, if applicable |
 
 ### `applications`
 
