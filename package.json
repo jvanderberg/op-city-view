@@ -1,0 +1,21 @@
+{
+  "name": "op-city-view",
+  "version": "1.0.0",
+  "description": "Oak Park CityView Portal - Residential Permit Data Exporter",
+  "main": "export-permits.js",
+  "scripts": {
+    "export": "node export-permits.js",
+    "test": "node export-permits.js --help"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:41157/git/jvanderberg/op-city-view"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.49.0",
+    "playwright-core": "^1.50.0"
+  }
+}
