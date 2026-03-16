@@ -7,7 +7,7 @@ local SQLite database.
 ## Requirements
 
 - **Node.js 22+** (uses built-in `node:sqlite`)
-- **Playwright Chromium** browser binary
+- **Playwright** (`npm install` pulls the browser binary)
 
 ## Setup
 
@@ -61,7 +61,7 @@ LEFT JOIN address_points ap ON av.pin = ap.pin
 WHERE av.township_name = 'Oak Park'
   AND av.year = 2024
   AND av.class IN ('202','203','204','205','206','207','208','209','210','234','278','295')
-ORDER BY ap.address
+ORDER BY CASE WHEN ap.address IS NULL THEN 1 ELSE 0 END, ap.address
 ```
 
 This yields ~10,300 single-family residential properties. The class filter
@@ -82,7 +82,7 @@ three districts:
 ## Usage
 
 ```bash
-# CSV-driven bulk scrape (restartable, 10s between requests)
+# CSV-driven bulk scrape (restartable, 2s between requests)
 node export-permits.js --parcels parcels.csv
 
 # Single address
@@ -97,8 +97,8 @@ node export-permits.js --file addresses.txt
 # Custom output path (default: cityview.db)
 node export-permits.js --output oakpark.db
 
-# Adjust delay between requests (default: 10000ms)
-node export-permits.js --delay 2000
+# Adjust delay between requests (default: 2000ms)
+node export-permits.js --delay 5000
 ```
 
 Or via npm scripts:
@@ -117,65 +117,108 @@ variables — **never commit them**:
 ```bash
 export CITYVIEW_EMAIL="you@example.com"
 export CITYVIEW_PASSWORD="your-password"
-node export-permits.js --address "1010 S EUCLID AVE"
+node export-permits.js --parcels parcels.csv
 ```
 
 Without credentials, only Code Enforcement records are exported.
+The scraper re-logs in every 20 parcels to prevent session expiry.
 
 ## Database Schema
 
-The SQLite database has four tables in a normalized relational structure:
+The SQLite database uses separate tables for code enforcement and permits:
 
 ```
-properties ──< applications ──< sub_permits
-                            ──< fees
-                            ──< inspections
+properties ──< code_enforcement ──< ce_inspections
+                                ──< ce_fees
+           ──< permits ──< sub_permits
+                        ──< fees
+                        ──< inspections
 ```
 
 ### `properties`
 
-One row per parcel. A parcel may have multiple addresses but is identified by
-its Cook County parcel number.
+One row per parcel. Populated from the driver CSV with Cook County data.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `parcel_number` | TEXT PK | Cook County parcel ID (e.g. `16184080040000`) |
-| `address` | TEXT | Street address used to look up the property |
+| `parcel_number` | TEXT PK | Cook County PIN (e.g. `16184080040000`) |
+| `address` | TEXT | Street address |
 | `latitude` | REAL | Latitude coordinate |
 | `longitude` | REAL | Longitude coordinate |
-| `property_class` | TEXT | Property classification (e.g. `Single-family`, `Multi-family`) |
-| `historic_district_id` | TEXT | Historic district identifier, if applicable |
+| `property_class` | TEXT | Cook County Assessor class code (e.g. `205`, `206`) |
+| `historic_district_id` | TEXT | Historic district name, if applicable |
 
-### `applications`
+### `code_enforcement`
 
-One row per permit application, code enforcement case, planning application,
-or license. This is the core record table.
+Code enforcement cases (complaints, violations, neighborhood walks).
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `reference_number` | TEXT PK | CityView reference (e.g. `PRRCA202100788`, `COD2006-00148`) |
+| `case_number` | TEXT PK | CityView case number (e.g. `COD2006-00148`) |
 | `parcel_number` | TEXT FK | References `properties.parcel_number` |
-| `record_type` | TEXT | `Permit`, `Code Enforcement`, `Planning`, or `License` |
-| `application_type` | TEXT | e.g. `Building`, `Electric (Alter or New)`, `Neighborhood Walk` |
-| `work_class` | TEXT | Category of work (e.g. `EV Charger`, `Alterations 1 and 2 unit-Family Dwellings`) |
-| `status` | TEXT | e.g. `Closed`, `Open`, `Finaled`, `Canceled` |
-| `description` | TEXT | Free-text description of work or complaint |
-| `application_date` | TEXT | Date the application was submitted (MM/DD/YYYY) |
-| `issued_date` | TEXT | Date the permit was issued |
-| `expiration_date` | TEXT | Permit expiration date |
-| `date_finaled` | TEXT | Date the application was finaled/closed |
+| `complaint_type` | TEXT | e.g. `Neighborhood Walk`, `Rats-External`, `Property Conditions/Standards` |
+| `status` | TEXT | e.g. `Open`, `Closed`, `Closed - No Violations` |
+| `description` | TEXT | Description of the complaint |
+| `date_entered` | TEXT | Date the case was opened |
+| `fetched_at` | TEXT | Timestamp when this record was scraped |
+
+### `ce_inspections`
+
+Inspections tied to code enforcement cases.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Auto-increment ID |
+| `case_number` | TEXT FK | References `code_enforcement.case_number` |
+| `inspection_type` | TEXT | Type of inspection |
+| `request_date` | TEXT | Date inspection was requested |
+| `scheduled_date` | TEXT | Date inspection is/was scheduled |
+| `completed_date` | TEXT | Date inspection was completed |
+| `inspector` | TEXT | Name of the inspector |
+| `result` | TEXT | Inspection result (e.g. `Pass`, `Fail`, `Violation`) |
+| `comments` | TEXT | Inspector notes |
+
+### `ce_fees`
+
+Fees tied to code enforcement cases.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER PK | Auto-increment ID |
+| `case_number` | TEXT FK | References `code_enforcement.case_number` |
+| `description` | TEXT | Fee description |
+| `amount` | REAL | Fee amount in dollars |
+| `paid` | REAL | Amount paid |
+| `owing` | REAL | Amount still owing |
+| `date_paid` | TEXT | Date the fee was paid, or `Not Paid` |
+
+### `permits`
+
+Permit applications, planning applications, and licenses.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `reference_number` | TEXT PK | CityView reference (e.g. `PRRCA202100788`) |
+| `parcel_number` | TEXT FK | References `properties.parcel_number` |
+| `record_type` | TEXT | `Permit`, `Planning`, or `License` |
+| `application_type` | TEXT | e.g. `Building`, `Electric (Alter or New)` |
+| `work_class` | TEXT | Category of work (e.g. `EV Charger`, `Alterations`) |
+| `status` | TEXT | e.g. `Closed`, `Finaled`, `Canceled`, `Pending` |
+| `description` | TEXT | Description of work |
+| `application_date` | TEXT | Date submitted |
+| `issued_date` | TEXT | Date issued |
+| `expiration_date` | TEXT | Expiration date |
+| `date_finaled` | TEXT | Date finaled/closed |
 | `fetched_at` | TEXT | Timestamp when this record was scraped |
 
 ### `sub_permits`
 
-Individual permits issued under a parent application. A single application
-(e.g. a building project) can have multiple sub-permits for Building,
-Electric, Plumbing, Mechanical, Plan Review, etc.
+Individual permits issued under a parent permit application.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `permit_number` | TEXT PK | Sub-permit number (e.g. `BLD2010-01782`, `ELE2010-00492`) |
-| `application_number` | TEXT FK | References `applications.reference_number` |
+| `permit_number` | TEXT PK | Sub-permit number (e.g. `BLD2010-01782`) |
+| `reference_number` | TEXT FK | References `permits.reference_number` |
 | `permit_type` | TEXT | `Building`, `Electric`, `Plumbing`, `Mechanical`, `Plan Review` |
 | `permit_status` | TEXT | `Finaled`, `Expired`, `Pending`, etc. |
 | `date_issued` | TEXT | Date this sub-permit was issued |
@@ -183,14 +226,13 @@ Electric, Plumbing, Mechanical, Plan Review, etc.
 
 ### `fees`
 
-Fee line items associated with an application. Includes both paid and
-outstanding fees.
+Fee line items associated with a permit/planning/license record.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Auto-increment ID |
-| `application_number` | TEXT FK | References `applications.reference_number` |
-| `description` | TEXT | Fee description (e.g. `425 - Miscellaneous electrical system installation(s)`) |
+| `reference_number` | TEXT FK | References `permits.reference_number` |
+| `description` | TEXT | Fee description |
 | `amount` | REAL | Fee amount in dollars |
 | `paid` | REAL | Amount paid |
 | `owing` | REAL | Amount still owing |
@@ -198,60 +240,58 @@ outstanding fees.
 
 ### `inspections`
 
-Inspection records associated with an application. Includes scheduled, completed,
-and pending inspections from all modules (permits, code enforcement, etc.).
+Inspections tied to permit/planning/license records.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INTEGER PK | Auto-increment ID |
-| `application_number` | TEXT FK | References `applications.reference_number` |
-| `inspection_type` | TEXT | Type of inspection (e.g. `Final`, `Rough-In`, `Neighborhood Walk`) |
+| `reference_number` | TEXT FK | References `permits.reference_number` |
+| `inspection_type` | TEXT | Type of inspection (e.g. `Final`, `Rough-In`) |
 | `request_date` | TEXT | Date inspection was requested |
 | `scheduled_date` | TEXT | Date inspection is/was scheduled |
 | `completed_date` | TEXT | Date inspection was completed |
 | `inspector` | TEXT | Name of the inspector |
-| `result` | TEXT | Inspection result (e.g. `Pass`, `Fail`, `Violation`) |
-| `comments` | TEXT | Inspector notes or comments |
+| `result` | TEXT | Inspection result (e.g. `Pass`, `Fail`) |
+| `comments` | TEXT | Inspector notes |
 
 ## Example Queries
 
 ```sql
 -- All permits for a property
-SELECT * FROM applications
+SELECT * FROM permits
 WHERE parcel_number = '16184080040000' AND record_type = 'Permit';
 
--- Sub-permits for a specific application
-SELECT * FROM sub_permits WHERE application_number = 'PRJ2010-00712';
+-- Sub-permits for a specific permit
+SELECT * FROM sub_permits WHERE reference_number = 'PRJ2010-00712';
 
--- Total fees by application
-SELECT application_number, SUM(amount) as total, SUM(paid) as paid
-FROM fees GROUP BY application_number;
+-- Total fees by permit
+SELECT reference_number, SUM(amount) as total, SUM(paid) as paid
+FROM fees GROUP BY reference_number;
 
--- Properties with outstanding fees
-SELECT p.address, a.reference_number, f.amount - f.paid as owing
+-- Properties with outstanding permit fees
+SELECT p.address, pm.reference_number, f.amount - f.paid as owing
 FROM fees f
-JOIN applications a ON a.reference_number = f.application_number
-JOIN properties p ON p.parcel_number = a.parcel_number
+JOIN permits pm ON pm.reference_number = f.reference_number
+JOIN properties p ON p.parcel_number = pm.parcel_number
 WHERE f.paid < f.amount;
 
 -- All open code enforcement cases
-SELECT p.address, a.reference_number, a.application_type, a.description
-FROM applications a
-JOIN properties p ON p.parcel_number = a.parcel_number
-WHERE a.record_type = 'Code Enforcement' AND a.status = 'Open';
+SELECT p.address, ce.case_number, ce.complaint_type, ce.description
+FROM code_enforcement ce
+JOIN properties p ON p.parcel_number = ce.parcel_number
+WHERE ce.status = 'Open';
 
--- Failed inspections
-SELECT p.address, a.reference_number, i.inspection_type, i.completed_date, i.result, i.comments
-FROM inspections i
-JOIN applications a ON a.reference_number = i.application_number
-JOIN properties p ON p.parcel_number = a.parcel_number
-WHERE i.result LIKE '%Fail%' OR i.result LIKE '%Violation%';
+-- Properties in the Frank Lloyd Wright historic district with CE cases
+SELECT p.address, ce.case_number, ce.complaint_type, ce.status
+FROM code_enforcement ce
+JOIN properties p ON p.parcel_number = ce.parcel_number
+WHERE p.historic_district_id = 'Frank Lloyd Wright';
 ```
 
 ## How It Works
 
-1. **Address lookup** — The Property `LocationSearch` API resolves an address
-   string to a parcel number via the `LocateResults` redirect URL.
+1. **Parcel list** — The driver CSV provides Cook County PINs for all Oak Park
+   residential properties, pre-tagged with coordinates and historic districts.
 
 2. **Record discovery** — For each module (Permit, Code Enforcement, Planning,
    License), the `LocatorResults` API is called with the parcel number. This
@@ -264,7 +304,7 @@ WHERE i.result LIKE '%Fail%' OR i.result LIKE '%Violation%';
    elements with all record detail (dates, descriptions, sub-permits, fees).
 
 4. **Storage** — All data is inserted into SQLite with `INSERT OR REPLACE`
-   semantics, so re-running for the same addresses updates existing records.
+   semantics, so re-running for the same parcels updates existing records.
 
 ## Data Source
 

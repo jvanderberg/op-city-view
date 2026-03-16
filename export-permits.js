@@ -139,7 +139,7 @@ function parseArgs() {
     street: null,
     file: null,
     output: 'cityview.db',
-    delay: 10000,
+    delay: 2000,
   };
 
   for (let i = 0; i < args.length; i++) {

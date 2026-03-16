@@ -184,7 +184,7 @@ async function main() {
     WHERE av.township_name = 'Oak Park'
       AND av.year = ?
       AND av.class IN (${placeholders})
-    ORDER BY ap.address
+    ORDER BY CASE WHEN ap.address IS NULL THEN 1 ELSE 0 END, ap.address
   `;
 
   const rows = db.prepare(query).all(opts.year, ...opts.classes);
