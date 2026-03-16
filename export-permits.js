@@ -142,59 +142,22 @@ function parseViewRefNumbers(viewHtml, idPrefix) {
   return [...new Set(refs)]; // deduplicate
 }
 
-// Generic module search -> LocatorResults API
-async function callModuleLocator(page, modulePath, searchEndpoint, locatorEndpoint, address) {
-  const searchResults = await page.evaluate(({ modulePath, searchEndpoint, term }) => {
-    return new Promise((resolve) => {
-      const token = jQuery('input[name="__RequestVerificationToken"]').val();
-      jQuery.ajax({
-        type: 'POST',
-        url: `/CityViewPortal/${modulePath}/${searchEndpoint}`,
-        dataType: 'json',
-        headers: { __RequestVerificationToken: token },
-        data: {
-          term: term,
-          returnInactiveAddresses: false,
-          module: '',
-          returnParcelNumbers: true,
-          appealPeriodStatusesOnly: false,
-          returnParksRoadsAndTrails: false,
-          locationCodeToAutosuggest: '',
-          isIntermentSearch: false,
-        },
-        success: (data) => {
-          let results = typeof data === 'string' ? JSON.parse(data) : data;
-          if (typeof results === 'string') results = JSON.parse(results);
-          resolve(results);
-        },
-        error: () => resolve([]),
-      });
-    });
-  }, { modulePath, searchEndpoint, term: address });
+// Call a module's LocatorResults API with a parcel number
+async function callLocatorByParcel(page, modulePath, parcel) {
+  await page.goto(`${BASE_URL}${PORTAL}/${modulePath}/Locator`, { waitUntil: 'networkidle', timeout: 30000 });
+  await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
 
-  if (!Array.isArray(searchResults) || searchResults.length === 0) return null;
-  const validResults = searchResults.filter(r => !r.includes('no matches'));
-  if (validResults.length === 0) return null;
-
-  const upperAddr = address.toUpperCase();
-  const match = validResults.find(r => r.toUpperCase().includes(upperAddr)) || validResults[0];
-
-  return page.evaluate(({ modulePath, locatorEndpoint, searchValue }) => {
+  return page.evaluate(({ modulePath, searchValue }) => {
     return new Promise((resolve) => {
       jQuery.ajax({
         type: 'GET',
-        url: `/CityViewPortal/${modulePath}/${locatorEndpoint}`,
+        url: `/CityViewPortal/${modulePath}/LocatorResults`,
         data: { searchValue },
         success: (data) => resolve(data),
         error: () => resolve(null),
       });
     });
-  }, { modulePath, locatorEndpoint, searchValue: match });
-}
-
-async function navigateToLocator(page, modulePath) {
-  await page.goto(`${BASE_URL}${PORTAL}/${modulePath}/Locator`, { waitUntil: 'networkidle', timeout: 30000 });
-  await page.waitForFunction(() => typeof window.jQuery !== 'undefined', { timeout: 10000 });
+  }, { modulePath, searchValue: parcel });
 }
 
 // Extract all displayField label:value pairs from the current page
@@ -275,42 +238,15 @@ async function getParcelNumber(page, address) {
 
 // ─── Module fetchers ─────────────────────────────────────────────────
 
-// Get all unique reference numbers for a module by searching both address and parcel
-async function getModuleRefs(page, modulePath, searchEndpoint, idPrefix, address, parcel) {
-  await navigateToLocator(page, modulePath);
-
-  const allRefs = new Set();
-
-  // Search by address
-  const addrResult = await callModuleLocator(page, modulePath, searchEndpoint, 'LocatorResults', address);
-  if (addrResult && addrResult.View) {
-    for (const ref of parseViewRefNumbers(addrResult.View, idPrefix)) allRefs.add(ref);
-  }
-
-  // Search by parcel number for more complete results
-  if (parcel) {
-    const parcelResult = await page.evaluate(({ modulePath, searchValue }) => {
-      return new Promise((resolve) => {
-        jQuery.ajax({
-          type: 'GET',
-          url: `/CityViewPortal/${modulePath}/LocatorResults`,
-          data: { searchValue },
-          success: (data) => resolve(data),
-          error: () => resolve(null),
-        });
-      });
-    }, { modulePath, searchValue: parcel });
-
-    if (parcelResult && parcelResult.View) {
-      for (const ref of parseViewRefNumbers(parcelResult.View, idPrefix)) allRefs.add(ref);
-    }
-  }
-
-  return [...allRefs];
+// Get all unique reference numbers for a module by searching by parcel
+async function getModuleRefs(page, modulePath, idPrefix, parcel) {
+  const result = await callLocatorByParcel(page, modulePath, parcel);
+  if (!result || !result.View) return [];
+  return parseViewRefNumbers(result.View, idPrefix);
 }
 
-async function fetchComplaints(page, address, parcel) {
-  const refs = await getModuleRefs(page, 'CodeEnforcement', 'ComplaintSearch', 'caseNumber', address, parcel);
+async function fetchComplaints(page, parcel) {
+  const refs = await getModuleRefs(page, 'CodeEnforcement', 'caseNumber', parcel);
   const records = [];
   for (const ref of refs) {
     const fields = await fetchStatusDetail(page, 'CodeEnforcement', ref);
@@ -326,8 +262,8 @@ async function fetchComplaints(page, address, parcel) {
   return records;
 }
 
-async function fetchPermits(page, address, parcel) {
-  const refs = await getModuleRefs(page, 'Permit', 'PermitSearch', 'permitNumber', address, parcel);
+async function fetchPermits(page, parcel) {
+  const refs = await getModuleRefs(page, 'Permit', 'permitNumber', parcel);
   const records = [];
   for (const ref of refs) {
     const fields = await fetchStatusDetail(page, 'Permit', ref);
@@ -349,8 +285,8 @@ async function fetchPermits(page, address, parcel) {
   return records;
 }
 
-async function fetchPlanning(page, address, parcel) {
-  const refs = await getModuleRefs(page, 'Planning', 'ApplicationSearch', 'applicationNumber', address, parcel);
+async function fetchPlanning(page, parcel) {
+  const refs = await getModuleRefs(page, 'Planning', 'applicationNumber', parcel);
   const records = [];
   for (const ref of refs) {
     const fields = await fetchStatusDetail(page, 'Planning', ref);
@@ -366,12 +302,8 @@ async function fetchPlanning(page, address, parcel) {
   return records;
 }
 
-async function fetchLicenses(page, address, parcel) {
-  await navigateToLocator(page, 'License');
-  const result = await callModuleLocator(page, 'License', 'LocationSearch', 'LocatorResults', address);
-  if (!result || !result.View) return [];
-
-  const refs = parseViewRefNumbers(result.View, 'licenseNumber');
+async function fetchLicenses(page, parcel) {
+  const refs = await getModuleRefs(page, 'License', 'licenseNumber', parcel);
   const records = [];
   for (const ref of refs) {
     const fields = await fetchStatusDetail(page, 'License', ref);
@@ -512,24 +444,24 @@ async function main() {
         const rows = [];
 
         // Code Enforcement via API + StatusReference detail
-        const complaints = await fetchComplaints(page, address, parcel);
+        const complaints = await fetchComplaints(page, parcel);
         console.log(`  -> ${complaints.length} code enforcement records`);
         for (const c of complaints) rows.push({ ...baseFields, ...c });
 
         // Permits via API + StatusReference detail (requires auth)
         if (isAuthenticated) {
-          const permits = await fetchPermits(page, address, parcel);
+          const permits = await fetchPermits(page, parcel);
           console.log(`  -> ${permits.length} permit records`);
           for (const p of permits) rows.push({ ...baseFields, ...p });
         }
 
         // Planning via API + StatusReference detail
-        const planning = await fetchPlanning(page, address, parcel);
+        const planning = await fetchPlanning(page, parcel);
         if (planning.length > 0) console.log(`  -> ${planning.length} planning records`);
         for (const p of planning) rows.push({ ...baseFields, ...p });
 
         // Licenses via API + StatusReference detail
-        const licenses = await fetchLicenses(page, address, parcel);
+        const licenses = await fetchLicenses(page, parcel);
         if (licenses.length > 0) console.log(`  -> ${licenses.length} license records`);
         for (const l of licenses) rows.push({ ...baseFields, ...l });
 
