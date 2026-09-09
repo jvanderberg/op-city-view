@@ -1,3 +1,4 @@
 node_modules/
 *.db
+!cityview.db
 !parcels.csv
